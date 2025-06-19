@@ -69,7 +69,7 @@ Create a file named `config.ini` in your project directory with the following co
 
 ```ini
 [BOT_SETTINGS]
-MAX_SEEN_ITEMS = 6000
+MAX_SEEN_ITEMS = 1000
 SEEN_FILE = seen_items.json
 
 [SCHEDULE]
