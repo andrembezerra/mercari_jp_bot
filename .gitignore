@@ -1,6 +1,8 @@
 key.env
 *.env
-myenv
+venv
 *.log
 config.ini
 seen_items.json
+venv/
+*.json

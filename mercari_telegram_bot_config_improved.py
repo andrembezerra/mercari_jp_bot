@@ -34,7 +34,8 @@ config_path = os.path.join(os.path.dirname(__file__), 'config.ini')
 if not os.path.exists(config_path):
     logging.critical(f"Configuration file '{config_path}' not found. Please create it.")
     sys.exit(1)
-config.read(config_path)
+# Exxpecting UTF-8 encoding when reading the config file
+config.read(config_path, encoding='utf-8')
 
 # General Settings
 MAX_SEEN_ITEMS = config.getint('BOT_SETTINGS', 'MAX_SEEN_ITEMS', fallback=6000)
