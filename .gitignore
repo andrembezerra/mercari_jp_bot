@@ -1,0 +1,6 @@
+key.env
+*.env
+myenv
+*.log
+config.ini
+seen_items.json
