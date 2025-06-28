@@ -7,5 +7,5 @@ seen_items.json
 venv/
 *.json
 *yml
-DockerFile
+Dockerfile
 docker-compose.yml
