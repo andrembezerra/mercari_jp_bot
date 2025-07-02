@@ -6,6 +6,3 @@ config.ini
 seen_items.json
 venv/
 *.json
-*yml
-Dockerfile
-docker-compose.yml
