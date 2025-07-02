@@ -34,7 +34,7 @@ config_path = os.path.join(os.path.dirname(__file__), 'config.ini')
 if not os.path.exists(config_path):
     logging.critical(f"Configuration file '{config_path}' not found. Please create it.")
     sys.exit(1)
-# Exxpecting UTF-8 encoding when reading the config file
+# Explicitly specify UTF-8 encoding when reading the config file
 config.read(config_path, encoding='utf-8')
 
 # General Settings
@@ -137,20 +137,6 @@ def initialize_webdriver():
     logging.critical("❌ WebDriver could not initialize after multiple attempts.")
     return None
 
-             # Retry logic for page loading - Pedding
-                retries = 3
-                for attempt in range(retries):
-                    try:
-                        driver.get(search_url)
-                        break
-                    except Exception as e:
-                        logging.warning(f"[{keyword}] Attempt {attempt+1} failed to load page: {e}")
-                        time.sleep(5)
-                else:
-                    logging.critical(f"[{keyword}] Failed to load page after multiple attempts.")
-                    driver.quit()
-                    return []
-
 def fetch_items(keyword: str, seen_items: dict, rate: float, driver) -> list[tuple]:
     """Fetches new items from Mercari for a given keyword using the provided WebDriver."""
     if not driver:
@@ -161,7 +147,19 @@ def fetch_items(keyword: str, seen_items: dict, rate: float, driver) -> list[tup
     url = f"https://jp.mercari.com/zh-TW/search?keyword={encoded_keyword}&lang=zh-TW&sort=created_time&order=desc&status=on_sale"
 
     logging.info(f"Navigating to: {url}")
-    driver.get(url)
+    
+    # Retry logic for page loading
+    retries = 3
+    for attempt in range(retries):
+        try:
+            driver.get(url)
+            break
+        except Exception as e:
+            logging.warning(f"[{keyword}] Attempt {attempt+1} failed to load page: {e}")
+            time.sleep(5)
+    else:
+        logging.critical(f"[{keyword}] Failed to load page after multiple attempts.")
+        return []
 
     try:
         WebDriverWait(driver, 15).until(
@@ -343,9 +341,14 @@ def main():
         if driver:
             driver.quit()
             logging.info("WebDriver closed.")
+        send_telegram_message("🔴 Mercari bot has stopped.") # Send message on any shutdown
         logging.info("Mercari bot is shutting down.")
 
 if __name__ == "__main__":
     main()
+
+# This script is designed to run as a standalone bot.
+# Ensure you have the required packages installed and the config.ini file set up correctly.
+
 
 
