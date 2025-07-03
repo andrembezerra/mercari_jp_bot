@@ -20,6 +20,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 from dotenv import load_dotenv
 import configparser
 
+
 # --- Configuration Loading --- #
 load_dotenv("key.env")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -53,6 +54,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 # --- Global Variables --- #
 daily_counts = defaultdict(int)
+CYCLES_BEFORE_RESTART = 10
+cycle_count = 0
 
 # --- Telegram Functions --- #
 def send_telegram_message(text: str):
@@ -280,6 +283,7 @@ def send_daily_summary():
 
 # --- Main Logic --- #
 def main():
+    global cycle_count
     logging.info("✅ Mercari bot is starting...")
     seen_items = load_seen_items()
     keywords_map = load_keywords() # Load keywords as a dictionary (original -> translated)
@@ -321,6 +325,14 @@ def main():
             logging.info("Finished a full cycle of keyword searches. Waiting for next cycle...")
             time.sleep(FULL_CYCLE_DELAY) # Wait before starting the next full cycle
 
+            cycle_count += 1
+            if cycle_count % CYCLES_BEFORE_RESTART == 0:
+                driver.quit()
+                driver = initialize_webdriver()
+                if not driver:
+                    logging.critical("WebDriver failed to re-initialize. Exiting.")
+                    break  # Exit the main loop if driver fails
+
     except KeyboardInterrupt:
         logging.info("Bot stopped by user (KeyboardInterrupt).")
     except Exception as e:
@@ -334,7 +346,9 @@ def main():
         send_telegram_message("🔴 Mercari bot has stopped.") # Send message on any shutdown
         logging.info("Mercari bot is shutting down.")
 
+def log_memory():
+    process = psutil.Process(os.getpid())
+    logging.info(f"Memory usage: {process.memory_info().rss / 1024 ** 2:.2f} MB")
+
 if __name__ == "__main__":
     main()
-
-
