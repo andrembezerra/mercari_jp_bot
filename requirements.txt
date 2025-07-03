@@ -3,5 +3,4 @@ requests
 schedule
 selenium
 webdriver-manager
-
-
+playwright

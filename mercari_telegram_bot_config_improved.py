@@ -348,7 +348,6 @@ if __name__ == "__main__":
     main()
 
 # This script is designed to run as a standalone bot.
-# Ensure you have the required packages installed and the config.ini file set up correctly.
-
+# Ensure you have the required packages installed and the config.ini file set up correctly
 
 
