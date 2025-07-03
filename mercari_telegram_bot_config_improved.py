@@ -21,7 +21,6 @@ from dotenv import load_dotenv
 import configparser
 import psutil
 
-
 # --- Configuration Loading --- #
 load_dotenv("key.env")
 BOT_TOKEN = os.getenv("BOT_TOKEN")

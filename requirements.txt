@@ -3,5 +3,5 @@ requests
 schedule
 selenium
 webdriver-manager
-
+psutil
 
