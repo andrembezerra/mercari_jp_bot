@@ -137,19 +137,7 @@ def initialize_webdriver():
     logging.critical("❌ WebDriver could not initialize after multiple attempts.")
     return None
 
-             # Retry logic for page loading - Pedding
-                retries = 3
-                for attempt in range(retries):
-                    try:
-                        driver.get(search_url)
-                        break
-                    except Exception as e:
-                        logging.warning(f"[{keyword}] Attempt {attempt+1} failed to load page: {e}")
-                        time.sleep(5)
-                else:
-                    logging.critical(f"[{keyword}] Failed to load page after multiple attempts.")
-                    driver.quit()
-                    return []
+# Retry logic for page loading should be handled inside fetch_items or similar functions, not at the global scope.
 
 def fetch_items(keyword: str, seen_items: dict, rate: float, driver) -> list[tuple]:
     """Fetches new items from Mercari for a given keyword using the provided WebDriver."""
