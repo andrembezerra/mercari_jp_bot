@@ -331,6 +331,7 @@ def main():
         if driver:
             driver.quit()
             logging.info("WebDriver closed.")
+        send_telegram_message("🔴 Mercari bot has stopped.") # Send message on any shutdown
         logging.info("Mercari bot is shutting down.")
 
 if __name__ == "__main__":
