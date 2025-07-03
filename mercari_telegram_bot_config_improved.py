@@ -19,6 +19,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 from dotenv import load_dotenv
 import configparser
+import psutil
 
 
 # --- Configuration Loading --- #
