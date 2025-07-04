@@ -4,8 +4,3 @@ schedule
 selenium
 webdriver-manager
 psutil
-<<<<<<< HEAD
-
-=======
->>>>>>> f8530555e6ed3d10d719ef668eee6935c9a63d7e
-
