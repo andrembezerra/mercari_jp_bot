@@ -230,6 +230,10 @@ def fetch_items(keyword: str, seen_items: dict, rate: float) -> list[tuple]:
         logging.error(f"Failed to fetch parent page for keyword '{keyword}': {e}")
         return []
     
+    if parent_response is None:
+        logging.error(f"Parent response is None for keyword '{keyword}'")
+        return []
+    
     parent_soup = BeautifulSoup(parent_response.text, 'html.parser')
     
     # Log all iframes found for debugging
@@ -251,26 +255,78 @@ def fetch_items(keyword: str, seen_items: dict, rate: float) -> list[tuple]:
     script_pattern = r"document\.querySelector\('#search_result_iframe'\)\.src\s*=\s*'([^']+)'"
     iframe_url = None
     
-    for script in scripts:
+    logging.info(f"Searching through {len(scripts)} scripts for iframe URL pattern")
+    
+    for i, script in enumerate(scripts):
         # Use getattr to avoid linter errors for .string
         script_content = getattr(script, 'string', None)
         if script_content:
             match = re.search(script_pattern, script_content)
             if match:
                 iframe_url = match.group(1)
+                logging.info(f"Found iframe URL in script {i+1}: {iframe_url}")
+                break
+            else:
+                # Log a sample of script content for debugging
+                if i < 3:  # Only log first 3 scripts
+                    sample_content = script_content[:200] if len(script_content) > 200 else script_content
+                    logging.debug(f"Script {i+1} sample content: {sample_content}")
+    
+    if not iframe_url:
+        logging.error("Could not extract iframe URL from JavaScript code.")
+        # Try alternative patterns
+        alternative_patterns = [
+            r"iframe.*src\s*=\s*'([^']+)'",
+            r"search_result_iframe.*src\s*=\s*'([^']+)'",
+            r"src\s*=\s*'([^']*mercari[^']*)'"
+        ]
+        
+        for pattern in alternative_patterns:
+            for script in scripts:
+                script_content = getattr(script, 'string', None)
+                if script_content:
+                    match = re.search(pattern, script_content, re.IGNORECASE)
+                    if match:
+                        iframe_url = match.group(1)
+                        logging.info(f"Found iframe URL using alternative pattern '{pattern}': {iframe_url}")
+                        break
+            if iframe_url:
                 break
     
     if not iframe_url:
         logging.error("Could not extract iframe URL from JavaScript code.")
         return []
     
-    logging.info(f"Extracted iframe URL from JavaScript: {iframe_url}")
+    # Make iframe URL absolute if it's relative
+    if not iframe_url.startswith('http'):
+        if iframe_url.startswith('/'):
+            iframe_url = urljoin('https://buyee.jp', iframe_url)
+        else:
+            iframe_url = urljoin('https://buyee.jp', iframe_url)
+        logging.info(f"Converted iframe URL to absolute: {iframe_url}")
+    
+    logging.info(f"Final iframe URL: {iframe_url}")
+    
+    # Test if the iframe URL is accessible
+    try:
+        test_response = requests.head(iframe_url, headers=headers, timeout=5)
+        logging.info(f"Iframe URL accessibility test: {test_response.status_code}")
+    except Exception as e:
+        logging.warning(f"Iframe URL accessibility test failed: {e}")
+    
+    # Log the iframe URL structure for debugging
+    logging.info(f"Iframe URL structure - Protocol: {iframe_url.split('://')[0] if '://' in iframe_url else 'None'}")
+    logging.info(f"Iframe URL structure - Domain: {iframe_url.split('/')[2] if len(iframe_url.split('/')) > 2 else 'None'}")
     
     # Fetch the iframe content
     try:
         response = fetch_with_retry(iframe_url, headers)
     except requests.RequestException as e:
         logging.error(f"Failed to fetch iframe content for keyword '{keyword}': {e}")
+        return []
+    
+    if response is None:
+        logging.error(f"Iframe response is None for keyword '{keyword}'")
         return []
     
     soup = BeautifulSoup(response.text, 'html.parser')
@@ -299,9 +355,12 @@ def fetch_items(keyword: str, seen_items: dict, rate: float) -> list[tuple]:
                 item_url = str(item_url)
             if not item_url:
                 continue
-                
             # Make URL absolute if it's relative
-            if item_url.startswith('/'):
+            original_item_url = item_url
+            if not item_url.startswith('http'):
+                # Fix the /undefined/ issue in the URL path
+                if '/undefined/' in item_url:
+                    item_url = item_url.replace('/undefined/', '/')
                 item_url = urljoin('https://buyee.jp', item_url)
             
             # Extract item title
@@ -321,7 +380,8 @@ def fetch_items(keyword: str, seen_items: dict, rate: float) -> list[tuple]:
                 image_url = str(image_url)
             
             # Make image URL absolute if it's relative
-            if image_url.startswith('/'):
+            original_image_url = image_url
+            if not image_url.startswith('http'):
                 image_url = urljoin('https://buyee.jp', image_url)
             
             # Extract item ID from URL
@@ -335,6 +395,25 @@ def fetch_items(keyword: str, seen_items: dict, rate: float) -> list[tuple]:
                 'image_url': image_url,
                 'keyword': keyword
             })
+            
+            # Debug logging for first few items
+            if len(items) <= 3:
+                logging.info(f"Item {len(items)}: URL={item_url}, Image={image_url}")
+                logging.info(f"Original item URL was: {original_item_url}")
+                # Test URL accessibility for debugging
+                if test_url_accessibility(item_url):
+                    logging.info(f"✅ Item URL {len(items)} is accessible")
+                else:
+                    logging.warning(f"❌ Item URL {len(items)} is NOT accessible")
+                    # Try to get more info about the failed request
+                    try:
+                        headers = {
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                        }
+                        response = requests.head(item_url, headers=headers, timeout=5)
+                        logging.warning(f"URL {item_url} returned status code: {response.status_code}")
+                    except Exception as e:
+                        logging.warning(f"URL {item_url} failed with error: {e}")
             
         except Exception as e:
             logging.warning(f"Error parsing item element: {e}")
@@ -580,6 +659,18 @@ def validate_config():
     for section in required_sections:
         if not config.has_section(section):
             raise ValueError(f"Missing required section: {section}")
+
+def test_url_accessibility(url: str, timeout: int = 5) -> bool:
+    """Test if a URL is accessible by making a HEAD request."""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.head(url, headers=headers, timeout=timeout)
+        return response.status_code == 200
+    except Exception as e:
+        logging.debug(f"URL accessibility test failed for {url}: {e}")
+        return False
 
 if __name__ == "__main__":
     main()
