@@ -2,6 +2,7 @@
 services:
   mercari-bot:
     build: .
+    image: andre/mercari-bot:buyee-site
     container_name: mercari-bot
     restart: unless-stopped
     env_file:
