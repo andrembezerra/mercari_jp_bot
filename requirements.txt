@@ -3,3 +3,4 @@ requests
 schedule
 psutil
 beautifulsoup4
+googletrans

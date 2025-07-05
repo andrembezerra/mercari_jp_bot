@@ -14,6 +14,9 @@ from bs4 import BeautifulSoup # Added BeautifulSoup
 from dotenv import load_dotenv
 import configparser
 import psutil
+from urllib.parse import urljoin
+from googletrans import Translator
+import asyncio
 
 # --- Configuration Loading --- #
 load_dotenv("key.env")
@@ -44,12 +47,86 @@ KEYWORD_BATCH_DELAY = config.getint('DELAYS', 'KEYWORD_BATCH_DELAY', fallback=10
 FULL_CYCLE_DELAY = config.getint('DELAYS', 'FULL_CYCLE_DELAY', fallback=60)
 
 # --- Logging Setup --- #
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.WARNING,  # Set to WARNING to reduce output
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+
+# Create a custom logger for important info messages
+info_logger = logging.getLogger('info')
+info_logger.setLevel(logging.INFO)
+handler = logging.StreamHandler(sys.stdout)
+handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+info_logger.addHandler(handler)
+info_logger.propagate = False  # Prevent duplicate messages
 
 # --- Global Variables --- #
 daily_counts = defaultdict(int)
 CYCLES_BEFORE_RESTART = 10 # This will no longer be relevant without WebDriver restarts
 cycle_count = 0
+translator = Translator()
+
+# Create a single event loop for translations
+translation_loop = None
+
+# Cache for exchange rate to avoid repeated API calls
+cached_exchange_rate = None
+last_exchange_rate_update = None
+EXCHANGE_RATE_CACHE_DURATION = 3600  # 1 hour in seconds
+
+def get_translation_loop():
+    """Get or create the translation event loop."""
+    global translation_loop
+    if translation_loop is None or translation_loop.is_closed():
+        translation_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(translation_loop)
+    return translation_loop
+
+def translate_title_with_fallback(title: str) -> str:
+    """Translate title with graceful fallback to original if translation fails."""
+    try:
+        translated = get_translation_loop().run_until_complete(translator.translate(title, src='ja', dest='en'))
+        if translated and hasattr(translated, 'text'):
+            title_en = translated.text
+            # Only use translation if it's different from original and not empty
+            if title_en and title_en.strip() and title_en != title:
+                return f"{title_en} ({title})"
+            else:
+                return title
+        else:
+            return title
+    except Exception as e:
+        logging.warning(f'Translation failed for title: {title[:50]}... | Error: {e}')
+        return title  # Fallback to original title
+
+def get_exchange_rate_with_fallback() -> float:
+    """Get exchange rate with caching and fallback to default value."""
+    global cached_exchange_rate, last_exchange_rate_update
+    
+    current_time = time.time()
+    
+    # Return cached rate if it's still valid
+    if (cached_exchange_rate is not None and 
+        last_exchange_rate_update is not None and 
+        current_time - last_exchange_rate_update < EXCHANGE_RATE_CACHE_DURATION):
+        logging.debug(f"Using cached exchange rate: {cached_exchange_rate}")
+        return cached_exchange_rate
+    
+    try:
+        rate = get_usd_to_jpy_rate()
+        cached_exchange_rate = rate
+        last_exchange_rate_update = current_time
+        info_logger.info(f"✅ Updated exchange rate: {rate}")
+        return rate
+    except Exception as e:
+        logging.warning(f"⚠️ Exchange rate fetch failed, using cached/default rate. Error: {e}")
+        if cached_exchange_rate is not None:
+            info_logger.info(f"Using cached exchange rate: {cached_exchange_rate}")
+            return cached_exchange_rate
+        else:
+            info_logger.info("Using default exchange rate: 145.0")
+            return 145.0
 
 # --- Telegram Functions --- #
 def send_telegram_message(text: str):
@@ -87,6 +164,18 @@ def send_telegram_photo(title: str, url: str, img_url: str, price: str, timestam
 # --- Price Conversion --- #
 def convert_price_to_yen(text: str, rate: float) -> tuple[str | None, int | None]:
     """Converts a price string to Japanese Yen based on the provided exchange rate."""
+    # Handle Japanese yen format without ¥ symbol (e.g., "9,800 yen")
+    yen_match = re.search(r'([\d,]+)\s*yen', text, re.IGNORECASE)
+    if yen_match:
+        amount_str = yen_match.group(1)
+        try:
+            amount_int = int(amount_str.replace(',', ''))
+            return f"¥{amount_int:,}".replace(",", "."), amount_int
+        except ValueError:
+            logging.warning(f"Could not parse yen amount '{amount_str}' from text: {text}")
+            return None, None
+    
+    # Handle other currency formats with symbols
     match = re.search(r'(¥|US\$|\$)\s*([\d,]+)', text)
     if not match:
         logging.debug(f"No price found in text: {text}")
@@ -111,9 +200,22 @@ def convert_price_to_yen(text: str, rate: float) -> tuple[str | None, int | None
     return f"¥{yen:,}".replace(",", "."), yen
 
 # --- Buyee Scraping --- #
+def fetch_with_retry(url, headers, max_retries=3, delay=2):
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, headers=headers, timeout=30)
+            response.raise_for_status()
+            return response
+        except requests.RequestException as e:
+            if attempt == attempt == max_retries - 1:
+                raise e
+            time.sleep(delay * (attempt + 1))  # Exponential backoff
+
 def fetch_items(keyword: str, seen_items: dict, rate: float) -> list[tuple]:
     """Fetches new items from Buyee for a given keyword using requests and BeautifulSoup."""
     encoded_keyword = urllib.parse.quote(keyword)
+    
+    info_logger.info(f"🔍 Checking keyword: {keyword}")
     
     # First, fetch the parent page to get the iframe src
     parent_url = f"https://buyee.jp/mercari/search?keyword={encoded_keyword}&order-sort=desc-created_time&status=on_sale"
@@ -121,92 +223,171 @@ def fetch_items(keyword: str, seen_items: dict, rate: float) -> list[tuple]:
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
+    
     try:
-        parent_response = requests.get(parent_url, headers=headers, timeout=10)
-        parent_response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Error fetching parent URL {parent_url}: {e}")
+        parent_response = fetch_with_retry(parent_url, headers)
+    except requests.RequestException as e:
+        logging.error(f"Failed to fetch parent page for keyword '{keyword}': {e}")
         return []
-
+    
     parent_soup = BeautifulSoup(parent_response.text, 'html.parser')
+    
+    # Log all iframes found for debugging
+    all_iframes = parent_soup.find_all('iframe')
+    logging.info(f"Found {len(all_iframes)} iframe(s) on the page")
+    for i, iframe in enumerate(all_iframes):
+        iframe_id = iframe.get('id') or 'NO_ID'  # type: ignore[attr-defined]
+        iframe_src = iframe.get('src') or 'NO_SRC'  # type: ignore[attr-defined]
+        logging.info(f"Iframe {i+1}: id='{iframe_id}', src='{iframe_src}'")
+    
     iframe_tag = parent_soup.find('iframe', id='search_result_iframe')
     
-    if not iframe_tag or not iframe_tag.get('src'):
-        logging.error("Could not find search_result_iframe or its src attribute.")
+    if not iframe_tag:
+        logging.error("Could not find search_result_iframe.")
         return []
-
-    iframe_url = iframe_tag['src']
-    logging.info(f"Fetching iframe URL: {iframe_url}")
-
+    
+    # Extract iframe URL from JavaScript code since iframe has no src initially
+    scripts = parent_soup.find_all('script')
+    script_pattern = r"document\.querySelector\('#search_result_iframe'\)\.src\s*=\s*'([^']+)'"
+    iframe_url = None
+    
+    for script in scripts:
+        # Use getattr to avoid linter errors for .string
+        script_content = getattr(script, 'string', None)
+        if script_content:
+            match = re.search(script_pattern, script_content)
+            if match:
+                iframe_url = match.group(1)
+                break
+    
+    if not iframe_url:
+        logging.error("Could not extract iframe URL from JavaScript code.")
+        return []
+    
+    logging.info(f"Extracted iframe URL from JavaScript: {iframe_url}")
+    
+    # Fetch the iframe content
     try:
-        response = requests.get(iframe_url, headers=headers, timeout=10)
-        response.raise_for_status()
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Error fetching iframe URL {iframe_url}: {e}")
+        response = fetch_with_retry(iframe_url, headers)
+    except requests.RequestException as e:
+        logging.error(f"Failed to fetch iframe content for keyword '{keyword}': {e}")
         return []
-
-    # Save the raw HTML response for debugging (this will now be the iframe content)
-    with open(f"buyee_iframe_response_{keyword}.html", "w", encoding="utf-8") as f:
-        f.write(response.text)
-    logging.info(f"Saved raw iframe HTML response to buyee_iframe_response_{keyword}.html")
-
+    
     soup = BeautifulSoup(response.text, 'html.parser')
-
-    # Corrected selectors based on re-inspection of Buyee.jp
-    # The item container is a div with class 'l-card-list__item'
-    item_elements = soup.select('div.l-card-list__item')
-
-    logging.info(f"Found {len(item_elements)} potential items for keyword: {keyword}")
-
-    new_items = []
-    for el in item_elements:
+    
+    # Find all item elements in the iframe
+    # Buyee uses div.simple_item__Ewdl1 for items
+    item_elements = soup.find_all('div', class_='simple_item__Ewdl1')
+    
+    if not item_elements:
+        logging.warning(f"No item elements found for keyword: {keyword}")
+        return []
+    
+    info_logger.info(f"Found {len(item_elements)} potential items for keyword: {keyword}")
+    
+    items = []
+    for item_element in item_elements:
         try:
-            # Extract URL (a tag within the item container)
-            href_tag = el.select_one('a.item-card__link')
-            href = href_tag['href'] if href_tag else None
-            if not href or not href.startswith('http'):
-                href = urllib.parse.urljoin(iframe_url, href) if href else None
+            # Find the link element
+            link_element = item_element.find('a', class_='simple_container__llX1q')  # type: ignore[attr-defined]
+            if not link_element:
+                continue
+                
+            # Extract item URL
+            item_url = link_element.get('href', '') if hasattr(link_element, 'get') else ''  # type: ignore[attr-defined]
+            if not isinstance(item_url, str):
+                item_url = str(item_url)
+            if not item_url:
+                continue
+                
+            # Make URL absolute if it's relative
+            if item_url.startswith('/'):
+                item_url = urljoin('https://buyee.jp', item_url)
+            
+            # Extract item title
+            title_element = link_element.find('span', class_='simple_name__XMcbt')  # type: ignore[attr-defined]
+            title = title_element.get_text(strip=True) if title_element else "No title"
+            # Translate title from Japanese to English with graceful fallback
+            full_title = translate_title_with_fallback(title)
+            
+            # Extract price
+            price_element = link_element.find('span', class_='simple_price__h13DP')  # type: ignore[attr-defined]
+            price_text = price_element.get_text(strip=True) if price_element else "No price"
+            
+            # Extract image URL
+            img_element = link_element.find('img', class_='cdn_container__T7Lek')  # type: ignore[attr-defined]
+            image_url = img_element.get('src', '') if img_element and hasattr(img_element, 'get') else ""  # type: ignore[attr-defined]
+            if not isinstance(image_url, str):
+                image_url = str(image_url)
+            
+            # Make image URL absolute if it's relative
+            if image_url.startswith('/'):
+                image_url = urljoin('https://buyee.jp', image_url)
+            
+            # Extract item ID from URL
+            item_id = item_url.split('/')[-1].split('?')[0] if item_url else ""
+            
+            items.append({
+                'id': item_id,
+                'title': full_title,
+                'price': price_text,
+                'url': item_url,
+                'image_url': image_url,
+                'keyword': keyword
+            })
+            
+        except Exception as e:
+            logging.warning(f"Error parsing item element: {e}")
+            continue
 
-            # Extract Title (div with class 'item-card__name')
-            title_tag = el.select_one('div.item-card__name')
-            title = title_tag.get_text(strip=True) if title_tag else "Untitled Item"
-
-            # Extract Image URL (img tag within the item container)
-            img_tag = el.select_one('img.item-card__thumbnail-image')
-            img = img_tag['src'] if img_tag and img_tag.has_attr('src') else (img_tag['data-src'] if img_tag and img_tag.has_attr('data-src') else None)
-            if not img or not img.startswith('http'):
-                img = urllib.parse.urljoin(iframe_url, img) if img else None
-
-            # Extract Price (div with class 'item-card__price')
-            price_tag = el.select_one('div.item-card__price')
-            price_text = price_tag.get_text(strip=True) if price_tag else ""
-            formatted_price, numeric_price = convert_price_to_yen(price_text, rate)
-
+    # Process items to check for new/cheaper items
+    new_items = []
+    for item in items:
+        try:
+            # Convert price to numeric value for comparison
+            formatted_price, numeric_price = convert_price_to_yen(item['price'], rate)
+            logging.debug(f"Processing item: {item['title']} | Raw price: {item['price']} | Formatted: {formatted_price} | Numeric: {numeric_price}")
+            
             if not formatted_price or not numeric_price:
-                logging.debug(f"Skipping item due to price conversion issue: {title} (Price text: {price_text})")
+                logging.debug(f"Skipping item due to price conversion issue: {item['title']} (Price text: {item['price']})")
                 continue
-
-            if not href or not img:
-                logging.debug(f"Skipping item due to missing URL or image: {title}")
+                
+            if not item['url'] or not item['image_url']:
+                logging.debug(f"Skipping item due to missing URL or image: {item['title']}")
                 continue
-
-            item_signature = hashlib.md5((title.lower() + img).encode()).hexdigest()
+                
+            # Create unique signature for item
+            item_signature = hashlib.md5((item['title'].lower() + item['image_url']).encode()).hexdigest()
+            logging.debug(f"Item signature: {item_signature}")
             timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
+            
             # Check if item is new or if a lower price is found
-            if item_signature not in seen_items or numeric_price < seen_items[item_signature]['price']:
-                new_items.append((title, href, img, formatted_price, timestamp))
+            if item_signature not in seen_items:
+                logging.debug(f"Item is new: {item['title']}")
+                new_items.append((item['title'], item['url'], item['image_url'], formatted_price, timestamp))
                 seen_items[item_signature] = {
                     'price': numeric_price,
                     'timestamp': timestamp
                 }
-                logging.info(f"New or cheaper item found: {title} at {formatted_price}")
+                info_logger.info(f"New item found: {item['title']} at {formatted_price}")
+            elif numeric_price < seen_items[item_signature]['price']:
+                logging.debug(f"Item is cheaper than before: {item['title']} | Old price: {seen_items[item_signature]['price']} | New price: {numeric_price}")
+                new_items.append((item['title'], item['url'], item['image_url'], formatted_price, timestamp))
+                seen_items[item_signature]['price'] = numeric_price
+                seen_items[item_signature]['timestamp'] = timestamp
+                info_logger.info(f"Cheaper item found: {item['title']} at {formatted_price}")
             else:
-                logging.debug(f"Item already seen or not cheaper: {title}")
-
+                logging.debug(f"Item already seen or not cheaper: {item['title']} | Old price: {seen_items[item_signature]['price']} | New price: {numeric_price}")
+                
         except Exception as e:
-            logging.warning(f"Error parsing item element: {e} - Element HTML: {el}")
-
+            logging.warning(f"Error processing item: {e}")
+            continue
+    
+    if not new_items:
+        info_logger.info(f"✅ No new items found for keyword: {keyword}")
+    else:
+        info_logger.info(f"📦 Found {len(new_items)} new/cheaper items for keyword: {keyword}")
+    
     return new_items
 
 # --- Data Management --- #
@@ -289,57 +470,119 @@ def send_daily_summary():
 # --- Main Logic --- #
 def main():
     global cycle_count
-    logging.info("✅ Mercari bot is starting...")
-    seen_items = load_seen_items()
-    keywords_map = load_keywords() # Load keywords as a dictionary (original -> translated)
-    original_keywords = list(keywords_map.keys()) # Get original keywords for iteration
-    rate = get_usd_to_jpy_rate()
-
+    
+    # Validate configuration first
+    try:
+        validate_config()
+        info_logger.info("✅ Configuration validation passed")
+    except ValueError as e:
+        logging.critical(f"Configuration error: {e}")
+        sys.exit(1)
+    
+    # Test Telegram connection
+    if not check_telegram_connection():
+        logging.critical("❌ Cannot connect to Telegram API. Please check your BOT_TOKEN.")
+        sys.exit(1)
+    else:
+        info_logger.info("✅ Telegram connection verified")
+    
+    info_logger.info("🚀 Mercari bot is starting...")
+    
+    # Load data with error handling
+    try:
+        seen_items = load_seen_items()
+        keywords_map = load_keywords()
+        original_keywords = list(keywords_map.keys())
+    except Exception as e:
+        logging.critical(f"Failed to load data: {e}")
+        sys.exit(1)
+    
     if not original_keywords:
         logging.critical("No keywords loaded. Please add keywords to the [KEYWORDS] section in config.ini.")
         sys.exit(1)
+    
+    info_logger.info(f"📋 Loaded {len(original_keywords)} keywords")
+    
+    # Get exchange rate with fallback
+    rate = get_exchange_rate_with_fallback()
 
     schedule.every().day.at(DAILY_SUMMARY_TIME).do(send_daily_summary)
 
     try:
         while True:
             for kw_original in original_keywords:
-                kw_translated = keywords_map.get(kw_original, kw_original) # Get translated keyword
-                logging.info(f"Starting search for keyword: {kw_original} (Translated: {kw_translated})")
-                items = fetch_items(kw_original, seen_items, rate)
+                try:
+                    kw_translated = keywords_map.get(kw_original, kw_original)
+                    logging.info(f"Starting search for keyword: {kw_original} (Translated: {kw_translated})")
+                    items = fetch_items(kw_original, seen_items, rate)
 
-                if items:
-                    send_telegram_message(f"🔍 Found new listings for: <b>{kw_translated}</b>...")
-                    daily_counts[kw_original] += len(items) # Use original keyword for daily_counts
-                    logging.info(f"🚀 Sending {len(items)} items for keyword: {kw_original}")
-                    for title, href, img, price, ts in sorted(items, key=lambda x: x[4]):
-                        send_telegram_photo(title, href, img, price, ts)
-                    send_telegram_message(f"✅ Done! Found <b>{len(items)}</b> new item{'s' if len(items) != 1 else ''} for <b>{kw_translated}</b>.")
-                else:
-                    logging.info(f"No new items found for keyword: {kw_original}")
+                    if items:
+                        send_telegram_message(f"🔍 Found new listings for: <b>{kw_translated}</b>...")
+                        daily_counts[kw_original] += len(items)
+                        logging.info(f"🚀 Sending {len(items)} items for keyword: {kw_original}")
+                        info_logger.info(f"Sending {len(items)} items to Telegram for keyword: {kw_original}")
+                        # Reverse the items list so newest items appear first in Telegram
+                        items.reverse()
+                        for item in items:
+                            # item is a tuple: (title, url, image_url, formatted_price, timestamp)
+                            title, url, image_url, formatted_price, timestamp = item
+                            send_telegram_photo(title, url, image_url, formatted_price, timestamp)
+                        send_telegram_message(f"✅ Done! Found <b>{len(items)}</b> new item{'s' if len(items) != 1 else ''} for <b>{kw_translated}</b>.")
+                    else:
+                        logging.info(f"No new items found for keyword: {kw_original}")
+                        
+                except Exception as e:
+                    logging.error(f"Error processing keyword '{kw_original}': {e}")
+                    # Continue with next keyword instead of crashing
+                    continue
 
-                time.sleep(KEYWORD_BATCH_DELAY)  # Delay between keyword batches to avoid overwhelming Buyee
+                time.sleep(KEYWORD_BATCH_DELAY)
 
-            save_seen_items(seen_items)
+            # Save data periodically
+            try:
+                save_seen_items(seen_items)
+            except Exception as e:
+                logging.error(f"Failed to save seen items: {e}")
+            
             schedule.run_pending()
             logging.info("Finished a full cycle of keyword searches. Waiting for next cycle...")
-            time.sleep(FULL_CYCLE_DELAY) # Wait before starting the next full cycle
+            time.sleep(FULL_CYCLE_DELAY)
 
     except KeyboardInterrupt:
-        logging.info("Bot stopped by user (KeyboardInterrupt).")
+        info_logger.info("🛑 Bot stopped by user (KeyboardInterrupt).")
     except Exception as e:
         logging.critical(f"An unhandled critical error occurred: {e}", exc_info=True)
-        send_telegram_message(f"❗️ An error occurred: {e}")
+        try:
+            send_telegram_message(f"❗️ An error occurred: {e}")
+        except:
+            logging.error("Failed to send error notification to Telegram")
         logging.error("Shutting down due to critical error.")
     finally:
-        send_telegram_message("🔴 Mercari bot has stopped.") # Send message on any shutdown
-        logging.info("Mercari bot is shutting down.")
+        try:
+            send_telegram_message("🔴 Mercari bot has stopped.")
+        except:
+            logging.error("Failed to send shutdown notification to Telegram")
+        info_logger.info("🔴 Mercari bot is shutting down.")
 
 def log_memory():
     process = psutil.Process(os.getpid())
     logging.info(f"Memory usage: {process.memory_info().rss / 1024 ** 2:.2f} MB")
 
+def check_telegram_connection():
+    """Verify Telegram bot is working"""
+    try:
+        response = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getMe")
+        return response.status_code == 200
+    except:
+        return False
+
+def validate_config():
+    """Validate all configuration settings"""
+    required_sections = ['BOT_SETTINGS', 'SCHEDULE', 'DELAYS', 'KEYWORDS']
+    for section in required_sections:
+        if not config.has_section(section):
+            raise ValueError(f"Missing required section: {section}")
+
 if __name__ == "__main__":
     main()
-
 
