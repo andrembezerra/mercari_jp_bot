@@ -65,8 +65,6 @@ info_logger.propagate = False  # Prevent duplicate messages
 
 # --- Global Variables --- #
 daily_counts = defaultdict(int)
-CYCLES_BEFORE_RESTART = 10 # This will no longer be relevant without WebDriver restarts
-cycle_count = 0
 translator = Translator()
 
 # Create a single event loop for translations
@@ -471,8 +469,6 @@ def send_daily_summary():
 
 # --- Main Logic --- #
 def main():
-    global cycle_count
-    
     # Validate configuration first
     try:
         validate_config()
