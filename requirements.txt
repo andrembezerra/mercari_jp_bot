@@ -1,6 +1,5 @@
 python-dotenv
 requests
 schedule
-selenium
-webdriver-manager
 psutil
+beautifulsoup4

@@ -10,13 +10,7 @@ import datetime
 import schedule
 import hashlib
 from collections import defaultdict
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from webdriver_manager.chrome import ChromeDriverManager
+from bs4 import BeautifulSoup # Added BeautifulSoup
 from dotenv import load_dotenv
 import configparser
 import psutil
@@ -54,7 +48,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 
 # --- Global Variables --- #
 daily_counts = defaultdict(int)
-CYCLES_BEFORE_RESTART = 10
+CYCLES_BEFORE_RESTART = 10 # This will no longer be relevant without WebDriver restarts
 cycle_count = 0
 
 # --- Telegram Functions --- #
@@ -116,73 +110,84 @@ def convert_price_to_yen(text: str, rate: float) -> tuple[str | None, int | None
 
     return f"¥{yen:,}".replace(",", "."), yen
 
-# --- Mercari Scraping --- #
-def initialize_webdriver():
-    """Initializes and returns a Chrome WebDriver instance."""
-    options = Options()
-    options.add_argument("--headless")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-extensions")
-    options.add_argument("--window-size=1920,8192")
-    options.add_argument("--blink-settings=imagesEnabled=false")
-
-    for attempt in range(3):
-        try:
-            service = Service(ChromeDriverManager().install())
-            driver = webdriver.Chrome(service=service, options=options)
-            logging.info("WebDriver initialized successfully.")
-            return driver
-        except Exception as e:
-            logging.error(f"WebDriver initialization failed (attempt {attempt + 1}/3): {e}")
-            time.sleep(5)
-    logging.critical("❌ WebDriver could not initialize after multiple attempts.")
-    return None
-
-# Retry logic for page loading should be handled inside fetch_items or similar functions, not at the global scope.
-
-def fetch_items(keyword: str, seen_items: dict, rate: float, driver) -> list[tuple]:
-    """Fetches new items from Mercari for a given keyword using the provided WebDriver."""
-    if not driver:
-        logging.error("WebDriver is not available. Cannot fetch items.")
+# --- Buyee Scraping --- #
+def fetch_items(keyword: str, seen_items: dict, rate: float) -> list[tuple]:
+    """Fetches new items from Buyee for a given keyword using requests and BeautifulSoup."""
+    encoded_keyword = urllib.parse.quote(keyword)
+    
+    # First, fetch the parent page to get the iframe src
+    parent_url = f"https://buyee.jp/mercari/search?keyword={encoded_keyword}&order-sort=desc-created_time&status=on_sale"
+    logging.info(f"Fetching parent URL: {parent_url}")
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
+    try:
+        parent_response = requests.get(parent_url, headers=headers, timeout=10)
+        parent_response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error fetching parent URL {parent_url}: {e}")
         return []
 
-    encoded_keyword = urllib.parse.quote(keyword)
-    url = f"https://jp.mercari.com/zh-TW/search?keyword={encoded_keyword}&lang=zh-TW&sort=created_time&order=desc&status=on_sale"
+    parent_soup = BeautifulSoup(parent_response.text, 'html.parser')
+    iframe_tag = parent_soup.find('iframe', id='search_result_iframe')
+    
+    if not iframe_tag or not iframe_tag.get('src'):
+        logging.error("Could not find search_result_iframe or its src attribute.")
+        return []
 
-    logging.info(f"Navigating to: {url}")
-    driver.get(url)
+    iframe_url = iframe_tag['src']
+    logging.info(f"Fetching iframe URL: {iframe_url}")
 
     try:
-        WebDriverWait(driver, 15).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, 'li[data-testid="item-cell"]'))
-        )
-        logging.info("Page loaded and items found.")
-    except Exception as e:
-        logging.error(f"Timeout waiting for items for keyword '{keyword}': {e}")
+        response = requests.get(iframe_url, headers=headers, timeout=10)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error fetching iframe URL {iframe_url}: {e}")
         return []
 
-    # Scroll down to load more items
-    for _ in range(2):  # Reduced scroll depth
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(1)
+    # Save the raw HTML response for debugging (this will now be the iframe content)
+    with open(f"buyee_iframe_response_{keyword}.html", "w", encoding="utf-8") as f:
+        f.write(response.text)
+    logging.info(f"Saved raw iframe HTML response to buyee_iframe_response_{keyword}.html")
 
-    elements = driver.find_elements(By.CSS_SELECTOR, 'li[data-testid="item-cell"]')
-    logging.info(f"Found {len(elements)} potential items for keyword: {keyword}")
-    elements.reverse()  # Process older items first
+    soup = BeautifulSoup(response.text, 'html.parser')
+
+    # Corrected selectors based on re-inspection of Buyee.jp
+    # The item container is a div with class 'l-card-list__item'
+    item_elements = soup.select('div.l-card-list__item')
+
+    logging.info(f"Found {len(item_elements)} potential items for keyword: {keyword}")
 
     new_items = []
-    for el in elements:
+    for el in item_elements:
         try:
-            href = el.find_element(By.XPATH, ".//a").get_attribute('href')
-            text = el.text.strip()
-            title = text.split('\n')[0] if text else "Untitled Item"
-            img = el.find_element(By.CSS_SELECTOR, "img").get_attribute('src')
-            formatted_price, numeric_price = convert_price_to_yen(text, rate)
+            # Extract URL (a tag within the item container)
+            href_tag = el.select_one('a.item-card__link')
+            href = href_tag['href'] if href_tag else None
+            if not href or not href.startswith('http'):
+                href = urllib.parse.urljoin(iframe_url, href) if href else None
+
+            # Extract Title (div with class 'item-card__name')
+            title_tag = el.select_one('div.item-card__name')
+            title = title_tag.get_text(strip=True) if title_tag else "Untitled Item"
+
+            # Extract Image URL (img tag within the item container)
+            img_tag = el.select_one('img.item-card__thumbnail-image')
+            img = img_tag['src'] if img_tag and img_tag.has_attr('src') else (img_tag['data-src'] if img_tag and img_tag.has_attr('data-src') else None)
+            if not img or not img.startswith('http'):
+                img = urllib.parse.urljoin(iframe_url, img) if img else None
+
+            # Extract Price (div with class 'item-card__price')
+            price_tag = el.select_one('div.item-card__price')
+            price_text = price_tag.get_text(strip=True) if price_tag else ""
+            formatted_price, numeric_price = convert_price_to_yen(price_text, rate)
 
             if not formatted_price or not numeric_price:
-                logging.debug(f"Skipping item due to price conversion issue: {title}")
+                logging.debug(f"Skipping item due to price conversion issue: {title} (Price text: {price_text})")
+                continue
+
+            if not href or not img:
+                logging.debug(f"Skipping item due to missing URL or image: {title}")
                 continue
 
             item_signature = hashlib.md5((title.lower() + img).encode()).hexdigest()
@@ -200,7 +205,7 @@ def fetch_items(keyword: str, seen_items: dict, rate: float, driver) -> list[tup
                 logging.debug(f"Item already seen or not cheaper: {title}")
 
         except Exception as e:
-            logging.warning(f"Error parsing item element: {e} - Element text: {el.text[:100]}...")
+            logging.warning(f"Error parsing item element: {e} - Element HTML: {el}")
 
     return new_items
 
@@ -294,10 +299,6 @@ def main():
         logging.critical("No keywords loaded. Please add keywords to the [KEYWORDS] section in config.ini.")
         sys.exit(1)
 
-    driver = initialize_webdriver()
-    if not driver:
-        sys.exit(1) # Exit if WebDriver fails to initialize
-
     schedule.every().day.at(DAILY_SUMMARY_TIME).do(send_daily_summary)
 
     try:
@@ -305,33 +306,24 @@ def main():
             for kw_original in original_keywords:
                 kw_translated = keywords_map.get(kw_original, kw_original) # Get translated keyword
                 logging.info(f"Starting search for keyword: {kw_original} (Translated: {kw_translated})")
-                items = fetch_items(kw_original, seen_items, rate, driver)
+                items = fetch_items(kw_original, seen_items, rate)
 
                 if items:
                     send_telegram_message(f"🔍 Found new listings for: <b>{kw_translated}</b>...")
                     daily_counts[kw_original] += len(items) # Use original keyword for daily_counts
                     logging.info(f"🚀 Sending {len(items)} items for keyword: {kw_original}")
-                    # Sort by timestamp to send in chronological order if desired, or by price etc.
                     for title, href, img, price, ts in sorted(items, key=lambda x: x[4]):
                         send_telegram_photo(title, href, img, price, ts)
                     send_telegram_message(f"✅ Done! Found <b>{len(items)}</b> new item{'s' if len(items) != 1 else ''} for <b>{kw_translated}</b>.")
                 else:
                     logging.info(f"No new items found for keyword: {kw_original}")
 
-                time.sleep(KEYWORD_BATCH_DELAY)  # Delay between keyword batches to avoid overwhelming Mercari
+                time.sleep(KEYWORD_BATCH_DELAY)  # Delay between keyword batches to avoid overwhelming Buyee
 
             save_seen_items(seen_items)
             schedule.run_pending()
             logging.info("Finished a full cycle of keyword searches. Waiting for next cycle...")
             time.sleep(FULL_CYCLE_DELAY) # Wait before starting the next full cycle
-
-            cycle_count += 1
-            if cycle_count % CYCLES_BEFORE_RESTART == 0:
-                driver.quit()
-                driver = initialize_webdriver()
-                if not driver:
-                    logging.critical("WebDriver failed to re-initialize. Exiting.")
-                    break  # Exit the main loop if driver fails
 
     except KeyboardInterrupt:
         logging.info("Bot stopped by user (KeyboardInterrupt).")
@@ -340,9 +332,6 @@ def main():
         send_telegram_message(f"❗️ An error occurred: {e}")
         logging.error("Shutting down due to critical error.")
     finally:
-        if driver:
-            driver.quit()
-            logging.info("WebDriver closed.")
         send_telegram_message("🔴 Mercari bot has stopped.") # Send message on any shutdown
         logging.info("Mercari bot is shutting down.")
 
@@ -352,3 +341,5 @@ def log_memory():
 
 if __name__ == "__main__":
     main()
+
+
