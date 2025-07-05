@@ -10,13 +10,15 @@ import datetime
 import schedule
 import hashlib
 from collections import defaultdict
-from bs4 import BeautifulSoup # Added BeautifulSoup
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 import configparser
 import psutil
-from urllib.parse import urljoin
 from googletrans import Translator
 import asyncio
+
+# Import urljoin from urllib.parse
+from urllib.parse import urljoin
 
 # --- Configuration Loading --- #
 load_dotenv("key.env")
@@ -513,7 +515,7 @@ def main():
             for kw_original in original_keywords:
                 try:
                     kw_translated = keywords_map.get(kw_original, kw_original)
-                    logging.info(f"Starting search for keyword: {kw_original} (Translated: {kw_translated})")
+                    info_logger.info(f"🔍 Starting search for keyword: {kw_original} (Translated: {kw_translated})")
                     items = fetch_items(kw_original, seen_items, rate)
 
                     if items:
@@ -545,7 +547,7 @@ def main():
                 logging.error(f"Failed to save seen items: {e}")
             
             schedule.run_pending()
-            logging.info("Finished a full cycle of keyword searches. Waiting for next cycle...")
+            info_logger.info("✅ Finished a full cycle of keyword searches. Waiting for next cycle...")
             time.sleep(FULL_CYCLE_DELAY)
 
     except KeyboardInterrupt:
