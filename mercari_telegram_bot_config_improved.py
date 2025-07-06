@@ -212,7 +212,7 @@ def fetch_with_retry(url, headers, max_retries=3, delay=2):
                 raise e
             time.sleep(delay * (attempt + 1))  # Exponential backoff
 
-def fetch_items(keyword: str, seen_items: dict, rate: float) -> list[tuple]:
+def fetch_items(keyword: str, seen_items: dict, rate: float) -> list:
     """Fetches new items from Buyee for a given keyword using requests and BeautifulSoup."""
     encoded_keyword = urllib.parse.quote(keyword)
     
@@ -471,7 +471,7 @@ def fetch_items(keyword: str, seen_items: dict, rate: float) -> list[tuple]:
     return new_items
 
 # --- Data Management --- #
-def load_keywords() -> dict[str, str]:
+def load_keywords() -> dict:
     """Loads keywords and their English translations from the config file."""
     try:
         keywords_dict = dict(config.items('KEYWORDS'))
