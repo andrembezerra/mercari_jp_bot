@@ -10,6 +10,7 @@ import datetime
 import schedule
 import hashlib
 from collections import defaultdict
+
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 import configparser
@@ -162,7 +163,7 @@ def send_telegram_photo(title: str, url: str, img_url: str, price: str, timestam
         logging.error(f"Failed to send photo for {title}: {e}")
 
 # --- Price Conversion --- #
-def convert_price_to_yen(text: str, rate: float) -> tuple[str | None, int | None]:
+def convert_price_to_yen(text: str, rate: float) -> tuple:
     """Converts a price string to Japanese Yen based on the provided exchange rate."""
     # Handle Japanese yen format without ¥ symbol (e.g., "9,800 yen")
     yen_match = re.search(r'([\d,]+)\s*yen', text, re.IGNORECASE)

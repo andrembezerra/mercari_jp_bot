@@ -6,3 +6,5 @@ config.ini
 seen_items.json
 venv/
 *.json
+mercari-bot.service
+update_bot.sh
