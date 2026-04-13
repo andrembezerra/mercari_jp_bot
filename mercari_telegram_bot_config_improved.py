@@ -7,47 +7,64 @@ import requests
 import logging
 import sys
 import datetime
-import schedule
 import hashlib
 from collections import defaultdict
 
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 import configparser
-import psutil
-from googletrans import Translator
 import asyncio
-
-# Import urljoin from urllib.parse
 from urllib.parse import urljoin
+
+try:
+    import schedule
+except ModuleNotFoundError:
+    class _ScheduleFallback:
+        def every(self):
+            raise RuntimeError("The 'schedule' package is required to run the bot")
+
+        def run_pending(self):
+            return None
+
+    schedule = _ScheduleFallback()
+
+try:
+    import psutil
+except ModuleNotFoundError:
+    psutil = None
+
+try:
+    from googletrans import Translator
+except ModuleNotFoundError:
+    class Translator:
+        async def translate(self, title, src='ja', dest='en'):
+            class _TranslationResult:
+                def __init__(self, text):
+                    self.text = text
+
+            return _TranslationResult(title)
 
 # --- Configuration Loading --- #
 load_dotenv("key.env")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-if not BOT_TOKEN or not CHAT_ID:
-    logging.critical("Missing Telegram credentials in .env file!")
-    sys.exit(1)
-
 config = configparser.ConfigParser()
 config_path = os.path.join(os.path.dirname(__file__), 'config.ini')
-if not os.path.exists(config_path):
-    logging.critical(f"Configuration file '{config_path}' not found. Please create it.")
-    sys.exit(1)
-# Exxpecting UTF-8 encoding when reading the config file
-config.read(config_path, encoding='utf-8')
+if os.path.exists(config_path):
+    config.read(config_path, encoding='utf-8')
 
 # General Settings
-MAX_SEEN_ITEMS = config.getint('BOT_SETTINGS', 'MAX_SEEN_ITEMS', fallback=6000)
-SEEN_FILE = os.path.join(os.path.dirname(__file__), config.get('BOT_SETTINGS', 'SEEN_FILE', fallback='seen_items.json'))
+MAX_SEEN_ITEMS = config.getint('BOT_SETTINGS', 'MAX_SEEN_ITEMS', fallback=6000) if config.has_section('BOT_SETTINGS') else 6000
+seen_file_name = config.get('BOT_SETTINGS', 'SEEN_FILE', fallback='seen_items.json') if config.has_section('BOT_SETTINGS') else 'seen_items.json'
+SEEN_FILE = os.path.join(os.path.dirname(__file__), seen_file_name)
 
 # Schedule Settings
-DAILY_SUMMARY_TIME = config.get('SCHEDULE', 'DAILY_SUMMARY_TIME', fallback='12:30')
+DAILY_SUMMARY_TIME = config.get('SCHEDULE', 'DAILY_SUMMARY_TIME', fallback='12:30') if config.has_section('SCHEDULE') else '12:30'
 
 # Delay Settings
-KEYWORD_BATCH_DELAY = config.getint('DELAYS', 'KEYWORD_BATCH_DELAY', fallback=10)
-FULL_CYCLE_DELAY = config.getint('DELAYS', 'FULL_CYCLE_DELAY', fallback=60)
+KEYWORD_BATCH_DELAY = config.getint('DELAYS', 'KEYWORD_BATCH_DELAY', fallback=10) if config.has_section('DELAYS') else 10
+FULL_CYCLE_DELAY = config.getint('DELAYS', 'FULL_CYCLE_DELAY', fallback=60) if config.has_section('DELAYS') else 60
 
 # --- Logging Setup --- #
 logging.basicConfig(
@@ -75,6 +92,18 @@ translation_loop = None
 cached_exchange_rate = None
 last_exchange_rate_update = None
 EXCHANGE_RATE_CACHE_DURATION = 3600  # 1 hour in seconds
+
+DEFAULT_BUYEE_HEADERS = {
+    'User-Agent': (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) '
+        'Chrome/136.0.0.0 Safari/537.36'
+    ),
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Upgrade-Insecure-Requests': '1',
+    'Referer': 'https://buyee.jp/mercari/',
+}
 
 def get_translation_loop():
     """Get or create the translation event loop."""
@@ -201,224 +230,145 @@ def convert_price_to_yen(text: str, rate: float) -> tuple:
     return f"¥{yen:,}".replace(",", "."), yen
 
 # --- Buyee Scraping --- #
-def fetch_with_retry(url, headers, max_retries=3, delay=2):
+def create_buyee_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update(DEFAULT_BUYEE_HEADERS)
+    return session
+
+
+def fetch_with_retry(session, url, headers=None, max_retries=3, delay=2, timeout=30):
+    last_error = None
+    request_headers = headers or {}
+
     for attempt in range(max_retries):
+        attempt_number = attempt + 1
         try:
-            response = requests.get(url, headers=headers, timeout=30)
+            response = session.get(url, headers=request_headers, timeout=timeout)
+            logging.info(
+                f"Buyee request attempt {attempt_number}/{max_retries} -> "
+                f"status={response.status_code} url={response.url}"
+            )
+
+            if response.status_code == 403:
+                logging.error(
+                    f"Buyee returned 403 for {response.url}. "
+                    f"Likely anti-bot/session rejection. Cookies: {session.cookies.get_dict()}"
+                )
+
             response.raise_for_status()
             return response
         except requests.RequestException as e:
-            if attempt == attempt == max_retries - 1:
-                raise e
-            time.sleep(delay * (attempt + 1))  # Exponential backoff
+            last_error = e
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(delay * (attempt + 1))
 
-def fetch_items(keyword: str, seen_items: dict, rate: float) -> list:
-    """Fetches new items from Buyee for a given keyword using requests and BeautifulSoup."""
-    encoded_keyword = urllib.parse.quote(keyword)
-    
-    info_logger.info(f"🔍 Checking keyword: {keyword}")
-    
-    # First, fetch the parent page to get the iframe src
-    parent_url = f"https://buyee.jp/mercari/search?keyword={encoded_keyword}&order-sort=desc-created_time&status=on_sale"
-    logging.info(f"Fetching parent URL: {parent_url}")
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    }
-    
-    try:
-        parent_response = fetch_with_retry(parent_url, headers)
-    except requests.RequestException as e:
-        logging.error(f"Failed to fetch parent page for keyword '{keyword}': {e}")
-        return []
-    
-    if parent_response is None:
-        logging.error(f"Parent response is None for keyword '{keyword}'")
-        return []
-    
-    parent_soup = BeautifulSoup(parent_response.text, 'html.parser')
-    
-    # Log all iframes found for debugging
-    all_iframes = parent_soup.find_all('iframe')
-    logging.info(f"Found {len(all_iframes)} iframe(s) on the page")
-    for i, iframe in enumerate(all_iframes):
-        iframe_id = iframe.get('id') or 'NO_ID'  # type: ignore[attr-defined]
-        iframe_src = iframe.get('src') or 'NO_SRC'  # type: ignore[attr-defined]
-        logging.info(f"Iframe {i+1}: id='{iframe_id}', src='{iframe_src}'")
-    
-    iframe_tag = parent_soup.find('iframe', id='search_result_iframe')
-    
-    if not iframe_tag:
-        logging.error("Could not find search_result_iframe.")
-        return []
-    
-    # Extract iframe URL from JavaScript code since iframe has no src initially
-    scripts = parent_soup.find_all('script')
-    script_pattern = r"document\.querySelector\('#search_result_iframe'\)\.src\s*=\s*'([^']+)'"
-    iframe_url = None
-    
-    logging.info(f"Searching through {len(scripts)} scripts for iframe URL pattern")
-    
-    for i, script in enumerate(scripts):
-        # Use getattr to avoid linter errors for .string
-        script_content = getattr(script, 'string', None)
-        if script_content:
-            match = re.search(script_pattern, script_content)
+    if last_error:
+        raise last_error
+    raise RuntimeError(f"Failed to fetch URL after retries: {url}")
+
+
+def _extract_image_url(img_element) -> str:
+    if not img_element:
+        return ""
+
+    image_url = ""
+    if hasattr(img_element, 'get'):
+        src = img_element.get('src', '')
+        if isinstance(src, str):
+            image_url = src
+
+        data_bind = img_element.get('data-bind', '')
+        if isinstance(data_bind, str):
+            match = re.search(r"imagePath:\s*'([^']+)'", data_bind)
             if match:
-                iframe_url = match.group(1)
-                logging.info(f"Found iframe URL in script {i+1}: {iframe_url}")
-                break
-            else:
-                # Log a sample of script content for debugging
-                if i < 3:  # Only log first 3 scripts
-                    sample_content = script_content[:200] if len(script_content) > 200 else script_content
-                    logging.debug(f"Script {i+1} sample content: {sample_content}")
-    
-    if not iframe_url:
-        logging.error("Could not extract iframe URL from JavaScript code.")
-        # Try alternative patterns
-        alternative_patterns = [
-            r"iframe.*src\s*=\s*'([^']+)'",
-            r"search_result_iframe.*src\s*=\s*'([^']+)'",
-            r"src\s*=\s*'([^']*mercari[^']*)'"
-        ]
-        
-        for pattern in alternative_patterns:
-            for script in scripts:
-                script_content = getattr(script, 'string', None)
-                if script_content:
-                    match = re.search(pattern, script_content, re.IGNORECASE)
-                    if match:
-                        iframe_url = match.group(1)
-                        logging.info(f"Found iframe URL using alternative pattern '{pattern}': {iframe_url}")
-                        break
-            if iframe_url:
-                break
-    
-    if not iframe_url:
-        logging.error("Could not extract iframe URL from JavaScript code.")
-        return []
-    
-    # Make iframe URL absolute if it's relative
-    if not iframe_url.startswith('http'):
-        if iframe_url.startswith('/'):
-            iframe_url = urljoin('https://buyee.jp', iframe_url)
-        else:
-            iframe_url = urljoin('https://buyee.jp', iframe_url)
-        logging.info(f"Converted iframe URL to absolute: {iframe_url}")
-    
-    logging.info(f"Final iframe URL: {iframe_url}")
-    
-    # Test if the iframe URL is accessible
-    try:
-        test_response = requests.head(iframe_url, headers=headers, timeout=5)
-        logging.info(f"Iframe URL accessibility test: {test_response.status_code}")
-    except Exception as e:
-        logging.warning(f"Iframe URL accessibility test failed: {e}")
-    
-    # Log the iframe URL structure for debugging
-    logging.info(f"Iframe URL structure - Protocol: {iframe_url.split('://')[0] if '://' in iframe_url else 'None'}")
-    logging.info(f"Iframe URL structure - Domain: {iframe_url.split('/')[2] if len(iframe_url.split('/')) > 2 else 'None'}")
-    
-    # Fetch the iframe content
-    try:
-        response = fetch_with_retry(iframe_url, headers)
-    except requests.RequestException as e:
-        logging.error(f"Failed to fetch iframe content for keyword '{keyword}': {e}")
-        return []
-    
-    if response is None:
-        logging.error(f"Iframe response is None for keyword '{keyword}'")
-        return []
-    
-    soup = BeautifulSoup(response.text, 'html.parser')
-    
-    # Find all item elements in the iframe
-    # Buyee uses div.simple_item__Ewdl1 for items
-    item_elements = soup.find_all('div', class_='simple_item__Ewdl1')
-    
+                image_url = match.group(1)
+
+    if image_url.startswith('//'):
+        return f"https:{image_url}"
+    if image_url and not image_url.startswith('http'):
+        return urljoin('https://buyee.jp', image_url)
+    return image_url
+
+
+def _extract_items_from_search_html(soup: BeautifulSoup, keyword: str) -> list:
+    item_elements = soup.select('ul.item-lists > li.list')
     if not item_elements:
-        logging.warning(f"No item elements found for keyword: {keyword}")
-        return []
-    
-    info_logger.info(f"Found {len(item_elements)} potential items for keyword: {keyword}")
-    
+        item_elements = soup.select('li.list')
+
     items = []
     for item_element in item_elements:
         try:
-            # Find the link element
-            link_element = item_element.find('a', class_='simple_container__llX1q')  # type: ignore[attr-defined]
+            link_element = item_element.find('a', href=re.compile(r'/mercari/item/'))
             if not link_element:
                 continue
-                
-            # Extract item URL
-            item_url = link_element.get('href', '') if hasattr(link_element, 'get') else ''  # type: ignore[attr-defined]
-            if not isinstance(item_url, str):
-                item_url = str(item_url)
-            if not item_url:
+
+            item_url = link_element.get('href', '') if hasattr(link_element, 'get') else ''
+            if not isinstance(item_url, str) or not item_url:
                 continue
-            # Make URL absolute if it's relative
-            original_item_url = item_url
+            if '/undefined/' in item_url:
+                item_url = item_url.replace('/undefined/', '/')
             if not item_url.startswith('http'):
-                # Fix the /undefined/ issue in the URL path
-                if '/undefined/' in item_url:
-                    item_url = item_url.replace('/undefined/', '/')
                 item_url = urljoin('https://buyee.jp', item_url)
-            
-            # Extract item title
-            title_element = link_element.find('span', class_='simple_name__XMcbt')  # type: ignore[attr-defined]
+
+            title_element = item_element.find(['h2', 'span'], class_=re.compile(r'(^| )(name|simple_name__)'))
             title = title_element.get_text(strip=True) if title_element else "No title"
-            # Translate title from Japanese to English with graceful fallback
-            full_title = translate_title_with_fallback(title)
-            
-            # Extract price
-            price_element = link_element.find('span', class_='simple_price__h13DP')  # type: ignore[attr-defined]
+
+            price_element = item_element.find(['p', 'span'], class_=re.compile(r'(^| )(price|simple_price__)'))
             price_text = price_element.get_text(strip=True) if price_element else "No price"
-            
-            # Extract image URL
-            img_element = link_element.find('img', class_='cdn_container__T7Lek')  # type: ignore[attr-defined]
-            image_url = img_element.get('src', '') if img_element and hasattr(img_element, 'get') else ""  # type: ignore[attr-defined]
-            if not isinstance(image_url, str):
-                image_url = str(image_url)
-            
-            # Make image URL absolute if it's relative
-            original_image_url = image_url
-            if not image_url.startswith('http'):
-                image_url = urljoin('https://buyee.jp', image_url)
-            
-            # Extract item ID from URL
+
+            img_element = item_element.find('img')
+            image_url = _extract_image_url(img_element)
+
             item_id = item_url.split('/')[-1].split('?')[0] if item_url else ""
-            
             items.append({
                 'id': item_id,
-                'title': full_title,
+                'title': translate_title_with_fallback(title),
                 'price': price_text,
                 'url': item_url,
                 'image_url': image_url,
                 'keyword': keyword
             })
-            
-            # Debug logging for first few items
-            if len(items) <= 3:
-                logging.info(f"Item {len(items)}: URL={item_url}, Image={image_url}")
-                logging.info(f"Original item URL was: {original_item_url}")
-                # Test URL accessibility for debugging
-                if test_url_accessibility(item_url):
-                    logging.info(f"✅ Item URL {len(items)} is accessible")
-                else:
-                    logging.warning(f"❌ Item URL {len(items)} is NOT accessible")
-                    # Try to get more info about the failed request
-                    try:
-                        headers = {
-                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-                        }
-                        response = requests.head(item_url, headers=headers, timeout=5)
-                        logging.warning(f"URL {item_url} returned status code: {response.status_code}")
-                    except Exception as e:
-                        logging.warning(f"URL {item_url} failed with error: {e}")
-            
         except Exception as e:
-            logging.warning(f"Error parsing item element: {e}")
+            logging.warning(f"Error parsing Buyee item element: {e}")
             continue
+
+    return items
+
+
+def fetch_items(keyword: str, seen_items: dict, rate: float, session=None) -> list:
+    """Fetches new items from Buyee for a given keyword using a shared session."""
+    encoded_keyword = urllib.parse.quote(keyword)
+    search_url = (
+        f"https://buyee.jp/mercari/search?keyword={encoded_keyword}"
+        f"&order-sort=desc-created_time&status=on_sale"
+    )
+    session = session or create_buyee_session()
+
+    info_logger.info(f"🔍 Checking keyword: {keyword}")
+    logging.info(f"Fetching Buyee search URL: {search_url}")
+
+    try:
+        response = fetch_with_retry(session, search_url)
+    except requests.RequestException as e:
+        logging.error(f"Failed to fetch Buyee search page for keyword '{keyword}': {e}")
+        return []
+
+    logging.info(f"Buyee session cookies after fetch: {session.cookies.get_dict()}")
+
+    soup = BeautifulSoup(response.text, 'html.parser')
+    items = _extract_items_from_search_html(soup, keyword)
+
+    if not items:
+        item_lists_count = len(soup.select('ul.item-lists'))
+        mercari_link_count = len(soup.select('a[href*="/mercari/item/"]'))
+        logging.warning(
+            f"No item elements found for keyword '{keyword}'. "
+            f"item-lists={item_lists_count}, mercari-links={mercari_link_count}"
+        )
+        return []
+
+    info_logger.info(f"Found {len(items)} potential items for keyword: {keyword}")
 
     # Process items to check for new/cheaper items
     new_items = []
@@ -583,6 +533,7 @@ def main():
     
     # Get exchange rate with fallback
     rate = get_exchange_rate_with_fallback()
+    buyee_session = create_buyee_session()
 
     schedule.every().day.at(DAILY_SUMMARY_TIME).do(send_daily_summary)
 
@@ -592,7 +543,7 @@ def main():
                 try:
                     kw_translated = keywords_map.get(kw_original, kw_original)
                     info_logger.info(f"🔍 Starting search for keyword: {kw_original} (Translated: {kw_translated})")
-                    items = fetch_items(kw_original, seen_items, rate)
+                    items = fetch_items(kw_original, seen_items, rate, session=buyee_session)
 
                     if items:
                         send_telegram_message(f"🔍 Found new listings for: <b>{kw_translated}</b>...")
@@ -643,19 +594,33 @@ def main():
         info_logger.info("🔴 Mercari bot is shutting down.")
 
 def log_memory():
+    if psutil is None:
+        logging.info("Memory usage unavailable: psutil is not installed")
+        return
     process = psutil.Process(os.getpid())
     logging.info(f"Memory usage: {process.memory_info().rss / 1024 ** 2:.2f} MB")
 
 def check_telegram_connection():
     """Verify Telegram bot is working"""
     try:
-        response = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getMe")
+        response = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getMe", timeout=5)
         return response.status_code == 200
-    except:
+    except requests.RequestException:
         return False
 
 def validate_config():
     """Validate all configuration settings"""
+    if not BOT_TOKEN or not CHAT_ID:
+        raise ValueError("Missing Telegram credentials in key.env")
+
+    try:
+        int(CHAT_ID)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"CHAT_ID must be a valid integer, got: {CHAT_ID!r}") from exc
+
+    if not os.path.exists(config_path):
+        raise ValueError(f"Configuration file '{config_path}' not found")
+
     required_sections = ['BOT_SETTINGS', 'SCHEDULE', 'DELAYS', 'KEYWORDS']
     for section in required_sections:
         if not config.has_section(section):
@@ -664,10 +629,7 @@ def validate_config():
 def test_url_accessibility(url: str, timeout: int = 5) -> bool:
     """Test if a URL is accessible by making a HEAD request."""
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-        response = requests.head(url, headers=headers, timeout=timeout)
+        response = requests.head(url, headers=DEFAULT_BUYEE_HEADERS, timeout=timeout)
         return response.status_code == 200
     except Exception as e:
         logging.debug(f"URL accessibility test failed for {url}: {e}")
@@ -675,4 +637,3 @@ def test_url_accessibility(url: str, timeout: int = 5) -> bool:
 
 if __name__ == "__main__":
     main()
-
