@@ -2,12 +2,12 @@ import time
 import json
 import os
 import re
+import sqlite3
 import urllib.parse
 import requests
 import logging
 import sys
 import datetime
-import hashlib
 from collections import defaultdict
 
 from bs4 import BeautifulSoup
@@ -55,9 +55,10 @@ if os.path.exists(config_path):
     config.read(config_path, encoding='utf-8')
 
 # General Settings
-MAX_SEEN_ITEMS = config.getint('BOT_SETTINGS', 'MAX_SEEN_ITEMS', fallback=6000) if config.has_section('BOT_SETTINGS') else 6000
-seen_file_name = config.get('BOT_SETTINGS', 'SEEN_FILE', fallback='seen_items.json') if config.has_section('BOT_SETTINGS') else 'seen_items.json'
-SEEN_FILE = os.path.join(os.path.dirname(__file__), seen_file_name)
+db_file_name = config.get('BOT_SETTINGS', 'DB_FILE', fallback='seen_items.db') if config.has_section('BOT_SETTINGS') else 'seen_items.db'
+DB_FILE = os.path.join(os.path.dirname(__file__), db_file_name)
+# Legacy JSON path — used only for one-time migration on first run
+SEEN_FILE = os.path.join(os.path.dirname(__file__), 'seen_items.json')
 
 # Schedule Settings
 DAILY_SUMMARY_TIME = config.get('SCHEDULE', 'DAILY_SUMMARY_TIME', fallback='12:30') if config.has_section('SCHEDULE') else '12:30'
@@ -174,10 +175,11 @@ def send_telegram_message(text: str):
     except requests.exceptions.RequestException as e:
         logging.error(f"Failed to send message: {e}")
 
-def send_telegram_photo(title: str, url: str, img_url: str, price: str, timestamp: str):
+def send_telegram_photo(title: str, url: str, img_url: str, price: str, keyword_label: str = ""):
     """Sends a photo with a caption to the configured Telegram chat."""
     api_url = f'https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto'
-    caption = f"<b>{title}</b>\nPrice: {price}\nTime: {timestamp}\n{url}"
+    keyword_line = f"\nKeyword: {keyword_label}" if keyword_label else ""
+    caption = f"<b>{title}</b>\nPrice: {price}{keyword_line}\n{url}"
     payload = {
         'chat_id': CHAT_ID,
         'photo': img_url,
@@ -312,6 +314,7 @@ def _extract_items_from_search_html(soup: BeautifulSoup, keyword: str) -> list:
                 item_url = urljoin('https://buyee.jp', item_url)
 
             title_element = item_element.find(['h2', 'span'], class_=re.compile(r'(^| )(name|simple_name__)'))
+            # Keep raw Japanese title — translation happens later, only for new items
             title = title_element.get_text(strip=True) if title_element else "No title"
 
             price_element = item_element.find(['p', 'span'], class_=re.compile(r'(^| )(price|simple_price__)'))
@@ -320,10 +323,14 @@ def _extract_items_from_search_html(soup: BeautifulSoup, keyword: str) -> list:
             img_element = item_element.find('img')
             image_url = _extract_image_url(img_element)
 
+            # Use Mercari item ID from URL as the stable unique identifier
             item_id = item_url.split('/')[-1].split('?')[0] if item_url else ""
+            if not item_id:
+                continue
+
             items.append({
                 'id': item_id,
-                'title': translate_title_with_fallback(title),
+                'title': title,
                 'price': price_text,
                 'url': item_url,
                 'image_url': image_url,
@@ -336,7 +343,7 @@ def _extract_items_from_search_html(soup: BeautifulSoup, keyword: str) -> list:
     return items
 
 
-def fetch_items(keyword: str, seen_items: dict, rate: float, session=None) -> list:
+def fetch_items(keyword: str, conn: sqlite3.Connection, rate: float, session=None) -> list:
     """Fetches new items from Buyee for a given keyword using a shared session."""
     encoded_keyword = urllib.parse.quote(keyword)
     search_url = (
@@ -374,41 +381,40 @@ def fetch_items(keyword: str, seen_items: dict, rate: float, session=None) -> li
     new_items = []
     for item in items:
         try:
+            # Use Mercari item ID as the stable unique key
+            item_id = item['id']
+
             # Convert price to numeric value for comparison
             formatted_price, numeric_price = convert_price_to_yen(item['price'], rate)
             logging.debug(f"Processing item: {item['title']} | Raw price: {item['price']} | Formatted: {formatted_price} | Numeric: {numeric_price}")
-            
+
             if not formatted_price or not numeric_price:
                 logging.debug(f"Skipping item due to price conversion issue: {item['title']} (Price text: {item['price']})")
                 continue
-                
+
             if not item['url'] or not item['image_url']:
                 logging.debug(f"Skipping item due to missing URL or image: {item['title']}")
                 continue
-                
-            # Create unique signature for item
-            item_signature = hashlib.md5((item['title'].lower() + item['image_url']).encode()).hexdigest()
-            logging.debug(f"Item signature: {item_signature}")
+
             timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            
-            # Check if item is new or if a lower price is found
-            if item_signature not in seen_items:
+            row = get_seen_item(conn, item_id)
+
+            if row is None:
+                # New item — translate only now to avoid wasted API calls
+                display_title = translate_title_with_fallback(item['title'])
                 logging.debug(f"Item is new: {item['title']}")
-                new_items.append((item['title'], item['url'], item['image_url'], formatted_price, timestamp))
-                seen_items[item_signature] = {
-                    'price': numeric_price,
-                    'timestamp': timestamp
-                }
+                new_items.append((display_title, item['url'], item['image_url'], formatted_price))
+                upsert_seen_item(conn, item_id, numeric_price, timestamp)
                 info_logger.info(f"New item found: {item['title']} at {formatted_price}")
-            elif numeric_price < seen_items[item_signature]['price']:
-                logging.debug(f"Item is cheaper than before: {item['title']} | Old price: {seen_items[item_signature]['price']} | New price: {numeric_price}")
-                new_items.append((item['title'], item['url'], item['image_url'], formatted_price, timestamp))
-                seen_items[item_signature]['price'] = numeric_price
-                seen_items[item_signature]['timestamp'] = timestamp
+            elif numeric_price < row[0]:
+                display_title = translate_title_with_fallback(item['title'])
+                logging.debug(f"Item is cheaper: {item['title']} | Old: {row[0]} | New: {numeric_price}")
+                new_items.append((display_title, item['url'], item['image_url'], formatted_price))
+                upsert_seen_item(conn, item_id, numeric_price, timestamp)
                 info_logger.info(f"Cheaper item found: {item['title']} at {formatted_price}")
             else:
-                logging.debug(f"Item already seen or not cheaper: {item['title']} | Old price: {seen_items[item_signature]['price']} | New price: {numeric_price}")
-                
+                logging.debug(f"Item already seen: {item['title']} | Stored: {row[0]} | Current: {numeric_price}")
+
         except Exception as e:
             logging.warning(f"Error processing item: {e}")
             continue
@@ -434,33 +440,71 @@ def load_keywords() -> dict:
         logging.critical("No [KEYWORDS] section found in config.ini.")
         return {}
 
-def load_seen_items() -> dict:
-    """Loads seen items from the JSON file."""
-    if os.path.exists(SEEN_FILE):
-        try:
-            with open(SEEN_FILE, 'r', encoding='utf-8') as f:
-                seen_data = json.load(f)
-            logging.info(f"Loaded {len(seen_data)} seen items.")
-            return seen_data
-        except json.JSONDecodeError as e:
-            logging.error(f"Error decoding JSON from '{SEEN_FILE}': {e}. Starting with empty seen items.")
-            return {}
-        except Exception as e:
-            logging.error(f"Error loading seen items from '{SEEN_FILE}': {e}. Starting with empty seen items.")
-            return {}
-    logging.info("No seen items file found. Starting fresh.")
-    return {}
-
-def save_seen_items(seen_items: dict):
-    """Saves seen items to the JSON file, trimming to MAX_SEEN_ITEMS."""
-    # Keep only the most recent MAX_SEEN_ITEMS
-    trimmed_items = dict(list(seen_items.items())[-MAX_SEEN_ITEMS:])
+def _migrate_json_to_db(conn: sqlite3.Connection):
+    """One-time import of seen_items.json into the DB, then renames the file."""
+    if not os.path.exists(SEEN_FILE):
+        return
     try:
-        with open(SEEN_FILE, 'w', encoding='utf-8') as f:
-            json.dump(trimmed_items, f, ensure_ascii=False, indent=2)
-        logging.info(f"Saved {len(trimmed_items)} seen items to '{SEEN_FILE}'.")
+        with open(SEEN_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        rows = [
+            (item_id,
+             info.get('price', 0),
+             info.get('timestamp', now),
+             info.get('timestamp', now))
+            for item_id, info in data.items()
+            if isinstance(info, dict)
+        ]
+        conn.executemany(
+            "INSERT OR IGNORE INTO seen_items (item_id, price, first_seen, last_seen) VALUES (?,?,?,?)",
+            rows
+        )
+        conn.commit()
+        os.rename(SEEN_FILE, SEEN_FILE + '.migrated')
+        info_logger.info(f"Migrated {len(rows)} items from seen_items.json → seen_items.db")
     except Exception as e:
-        logging.error(f"Failed to save seen items: {e}")
+        logging.warning(f"JSON migration failed (non-fatal): {e}")
+
+
+def init_db() -> sqlite3.Connection:
+    """Open (or create) the SQLite DB, enable WAL mode, create table, run migration."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS seen_items (
+            item_id    TEXT    PRIMARY KEY,
+            price      INTEGER NOT NULL,
+            first_seen TEXT    NOT NULL,
+            last_seen  TEXT    NOT NULL
+        )
+    """)
+    conn.commit()
+    _migrate_json_to_db(conn)
+    item_count = conn.execute("SELECT COUNT(*) FROM seen_items").fetchone()[0]
+    info_logger.info(f"DB ready at {DB_FILE} ({item_count} items tracked)")
+    return conn
+
+
+def get_seen_item(conn: sqlite3.Connection, item_id: str):
+    """Return (price, first_seen) tuple or None if not seen before."""
+    return conn.execute(
+        "SELECT price, first_seen FROM seen_items WHERE item_id = ?",
+        (item_id,)
+    ).fetchone()
+
+
+def upsert_seen_item(conn: sqlite3.Connection, item_id: str, price: int, timestamp: str):
+    """Insert new item or update price and last_seen for an existing item."""
+    conn.execute("""
+        INSERT INTO seen_items (item_id, price, first_seen, last_seen)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(item_id) DO UPDATE SET
+            price     = excluded.price,
+            last_seen = excluded.last_seen
+    """, (item_id, price, timestamp, timestamp))
+    conn.commit()
 
 # --- Exchange Rate --- #
 def get_usd_to_jpy_rate() -> float:
@@ -517,8 +561,9 @@ def main():
     info_logger.info("🚀 Mercari bot is starting...")
     
     # Load data with error handling
+    conn = None
     try:
-        seen_items = load_seen_items()
+        conn = init_db()
         keywords_map = load_keywords()
         original_keywords = list(keywords_map.keys())
     except Exception as e:
@@ -543,20 +588,16 @@ def main():
                 try:
                     kw_translated = keywords_map.get(kw_original, kw_original)
                     info_logger.info(f"🔍 Starting search for keyword: {kw_original} (Translated: {kw_translated})")
-                    items = fetch_items(kw_original, seen_items, rate, session=buyee_session)
+                    items = fetch_items(kw_original, conn, rate, session=buyee_session)
 
                     if items:
-                        send_telegram_message(f"🔍 Found new listings for: <b>{kw_translated}</b>...")
                         daily_counts[kw_original] += len(items)
-                        logging.info(f"🚀 Sending {len(items)} items for keyword: {kw_original}")
                         info_logger.info(f"Sending {len(items)} items to Telegram for keyword: {kw_original}")
-                        # Reverse the items list so newest items appear first in Telegram
+                        # Reverse so newest items appear first in Telegram
                         items.reverse()
                         for item in items:
-                            # item is a tuple: (title, url, image_url, formatted_price, timestamp)
-                            title, url, image_url, formatted_price, timestamp = item
-                            send_telegram_photo(title, url, image_url, formatted_price, timestamp)
-                        send_telegram_message(f"✅ Done! Found <b>{len(items)}</b> new item{'s' if len(items) != 1 else ''} for <b>{kw_translated}</b>.")
+                            title, url, image_url, formatted_price = item
+                            send_telegram_photo(title, url, image_url, formatted_price, keyword_label=kw_translated)
                     else:
                         logging.info(f"No new items found for keyword: {kw_original}")
                         
@@ -567,12 +608,6 @@ def main():
 
                 time.sleep(KEYWORD_BATCH_DELAY)
 
-            # Save data periodically
-            try:
-                save_seen_items(seen_items)
-            except Exception as e:
-                logging.error(f"Failed to save seen items: {e}")
-            
             schedule.run_pending()
             info_logger.info("✅ Finished a full cycle of keyword searches. Waiting for next cycle...")
             time.sleep(FULL_CYCLE_DELAY)
@@ -587,6 +622,8 @@ def main():
             logging.error("Failed to send error notification to Telegram")
         logging.error("Shutting down due to critical error.")
     finally:
+        if conn:
+            conn.close()
         try:
             send_telegram_message("🔴 Mercari bot has stopped.")
         except:

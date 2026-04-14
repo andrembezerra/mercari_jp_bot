@@ -1,3 +1,4 @@
+import sqlite3
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -6,6 +7,21 @@ import requests
 from bs4 import BeautifulSoup
 
 import mercari_telegram_bot_config_improved as bot
+
+
+def make_test_db() -> sqlite3.Connection:
+    """Create an in-memory SQLite DB with the seen_items schema for tests."""
+    conn = sqlite3.connect(":memory:")
+    conn.execute("""
+        CREATE TABLE seen_items (
+            item_id    TEXT    PRIMARY KEY,
+            price      INTEGER NOT NULL,
+            first_seen TEXT    NOT NULL,
+            last_seen  TEXT    NOT NULL
+        )
+    """)
+    conn.commit()
+    return conn
 
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "buyee_search_sample.html"
@@ -87,8 +103,10 @@ class BuyeeScraperTests(unittest.TestCase):
             DummyResponse(status_code=200, url="https://buyee.jp/mercari/search?keyword=test", text=html),
         ])
 
+        conn = make_test_db()
         with mock.patch.object(bot, "translate_title_with_fallback", side_effect=lambda title: title):
-            items = bot.fetch_items("test", seen_items={}, rate=145.0, session=session)
+            items = bot.fetch_items("test", conn, rate=145.0, session=session)
+        conn.close()
 
         self.assertEqual(len(items), 2)
 
