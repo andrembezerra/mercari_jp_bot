@@ -658,6 +658,25 @@ def _cmd_summary(conn: sqlite3.Connection, args: str):
     send_telegram_message("\n".join(lines))
 
 
+def _cmd_help():
+    send_telegram_message(
+        "🤖 <b>Comandos disponíveis</b>\n"
+        "\n"
+        "<b>Keywords</b>\n"
+        "/keywords — lista todas as keywords ativas\n"
+        "/addkeyword &lt;keyword&gt; = &lt;label&gt; — adiciona uma keyword\n"
+        "/removekeyword &lt;keyword&gt; — remove uma keyword\n"
+        "\n"
+        "<b>Summary</b>\n"
+        "/summary — todos os keywords, últimas 24h\n"
+        "/summary &lt;período&gt; — todos os keywords no período\n"
+        "/summary &lt;label&gt; — keyword específica, últimas 24h\n"
+        "/summary &lt;label&gt; &lt;período&gt; — keyword específica no período\n"
+        "\n"
+        "Períodos: <code>24h</code> · <code>3d</code> · <code>7d</code> · <code>30d</code>"
+    )
+
+
 # --- Telegram Command Polling --- #
 def check_telegram_commands(conn: sqlite3.Connection, offset: int) -> int:
     """Poll getUpdates for new bot commands. Returns updated offset."""
@@ -684,7 +703,9 @@ def check_telegram_commands(conn: sqlite3.Connection, offset: int) -> int:
             logging.warning(f"Ignored command from unauthorised chat_id={chat_id}")
             continue
 
-        if text == "/keywords" or text.startswith("/keywords "):
+        if text == "/help":
+            _cmd_help()
+        elif text == "/keywords" or text.startswith("/keywords "):
             _cmd_list_keywords(conn)
         elif text.startswith("/addkeyword "):
             _cmd_add_keyword(conn, text[len("/addkeyword "):].strip())
