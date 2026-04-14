@@ -467,8 +467,26 @@ def _migrate_json_to_db(conn: sqlite3.Connection):
         logging.warning(f"JSON migration failed (non-fatal): {e}")
 
 
+def _migrate_keywords_to_db(conn: sqlite3.Connection):
+    """One-time import of keywords from config.ini [KEYWORDS] into the DB."""
+    existing = conn.execute("SELECT COUNT(*) FROM keywords").fetchone()[0]
+    if existing > 0:
+        return  # Already populated — skip
+    try:
+        keywords_dict = dict(config.items('KEYWORDS'))
+        rows = [(kw, label) for kw, label in keywords_dict.items()]
+        if rows:
+            conn.executemany(
+                "INSERT OR IGNORE INTO keywords (keyword, label) VALUES (?,?)", rows
+            )
+            conn.commit()
+            info_logger.info(f"Migrated {len(rows)} keywords from config.ini to DB")
+    except configparser.NoSectionError:
+        pass
+
+
 def init_db() -> sqlite3.Connection:
-    """Open (or create) the SQLite DB, enable WAL mode, create table, run migration."""
+    """Open (or create) the SQLite DB, enable WAL mode, create tables, run migrations."""
     conn = sqlite3.connect(DB_FILE)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
@@ -480,10 +498,18 @@ def init_db() -> sqlite3.Connection:
             last_seen  TEXT    NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS keywords (
+            keyword TEXT PRIMARY KEY,
+            label   TEXT NOT NULL
+        )
+    """)
     conn.commit()
     _migrate_json_to_db(conn)
+    _migrate_keywords_to_db(conn)
     item_count = conn.execute("SELECT COUNT(*) FROM seen_items").fetchone()[0]
-    info_logger.info(f"DB ready at {DB_FILE} ({item_count} items tracked)")
+    kw_count = conn.execute("SELECT COUNT(*) FROM keywords").fetchone()[0]
+    info_logger.info(f"DB ready at {DB_FILE} ({item_count} items tracked, {kw_count} keywords)")
     return conn
 
 
@@ -505,6 +531,90 @@ def upsert_seen_item(conn: sqlite3.Connection, item_id: str, price: int, timesta
             last_seen = excluded.last_seen
     """, (item_id, price, timestamp, timestamp))
     conn.commit()
+
+# --- Keyword Management --- #
+def load_keywords_from_db(conn: sqlite3.Connection) -> dict:
+    """Returns {keyword: label} dict from the DB."""
+    rows = conn.execute("SELECT keyword, label FROM keywords").fetchall()
+    return {kw: label for kw, label in rows}
+
+
+def _cmd_list_keywords(conn: sqlite3.Connection):
+    kws = load_keywords_from_db(conn)
+    if not kws:
+        send_telegram_message("Nenhuma keyword cadastrada.\n\nUse /addkeyword &lt;keyword&gt; = &lt;label&gt;")
+        return
+    lines = ["📋 <b>Keywords ativas:</b>"]
+    for kw, label in kws.items():
+        lines.append(f"• {kw} = {label}")
+    send_telegram_message("\n".join(lines))
+
+
+def _cmd_add_keyword(conn: sqlite3.Connection, args: str):
+    if "=" in args:
+        parts = args.split("=", 1)
+        keyword = parts[0].strip()
+        label = parts[1].strip()
+    else:
+        keyword = args.strip()
+        label = keyword
+    if not keyword:
+        send_telegram_message("❌ Uso: /addkeyword &lt;keyword&gt; = &lt;label&gt;")
+        return
+    conn.execute("INSERT OR REPLACE INTO keywords (keyword, label) VALUES (?,?)", (keyword, label))
+    conn.commit()
+    send_telegram_message(f"✅ Keyword adicionada: <b>{keyword}</b> = {label}")
+    info_logger.info(f"Keyword added via Telegram: {keyword} = {label}")
+
+
+def _cmd_remove_keyword(conn: sqlite3.Connection, keyword: str):
+    if not keyword:
+        send_telegram_message("❌ Uso: /removekeyword &lt;keyword&gt;")
+        return
+    cur = conn.execute("DELETE FROM keywords WHERE keyword = ?", (keyword,))
+    conn.commit()
+    if cur.rowcount:
+        send_telegram_message(f"🗑 Keyword removida: <b>{keyword}</b>")
+        info_logger.info(f"Keyword removed via Telegram: {keyword}")
+    else:
+        send_telegram_message(f"❌ Keyword não encontrada: <b>{keyword}</b>")
+
+
+# --- Telegram Command Polling --- #
+def check_telegram_commands(conn: sqlite3.Connection, offset: int) -> int:
+    """Poll getUpdates for new bot commands. Returns updated offset."""
+    try:
+        resp = requests.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
+            params={"offset": offset, "timeout": 0, "allowed_updates": ["message"]},
+            timeout=5
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logging.warning(f"getUpdates failed: {e}")
+        return offset
+
+    for update in data.get("result", []):
+        offset = update["update_id"] + 1
+        msg = update.get("message", {})
+        chat_id = str(msg.get("chat", {}).get("id", ""))
+        text = msg.get("text", "").strip()
+
+        # Only process commands from the authorised chat
+        if chat_id != str(CHAT_ID):
+            logging.warning(f"Ignored command from unauthorised chat_id={chat_id}")
+            continue
+
+        if text == "/keywords" or text.startswith("/keywords "):
+            _cmd_list_keywords(conn)
+        elif text.startswith("/addkeyword "):
+            _cmd_add_keyword(conn, text[len("/addkeyword "):].strip())
+        elif text.startswith("/removekeyword "):
+            _cmd_remove_keyword(conn, text[len("/removekeyword "):].strip())
+
+    return offset
+
 
 # --- Exchange Rate --- #
 def get_usd_to_jpy_rate() -> float:
@@ -532,11 +642,7 @@ def send_daily_summary():
         lines.append("No activity recorded today.")
     else:
         for kw_original, count in daily_counts.items():
-            # Assuming keywords_map is accessible or passed, or we re-load it
-            # For simplicity, let's re-load it here, or pass it as an argument
-            keywords_map = load_keywords() # Re-load for summary, or pass as arg
-            kw_translated = keywords_map.get(kw_original, kw_original) # Use original if translation not found
-            lines.append(f"• {kw_translated}: {count} new item{'s' if count != 1 else ''}")
+            lines.append(f"• {kw_original}: {count} new item{'s' if count != 1 else ''}")
     send_telegram_message("\n".join(lines))
     daily_counts.clear()
     logging.info("Daily summary sent and daily counts cleared.")
@@ -564,29 +670,37 @@ def main():
     conn = None
     try:
         conn = init_db()
-        keywords_map = load_keywords()
-        original_keywords = list(keywords_map.keys())
     except Exception as e:
-        logging.critical(f"Failed to load data: {e}")
+        logging.critical(f"Failed to initialise DB: {e}")
         sys.exit(1)
-    
-    if not original_keywords:
-        logging.critical("No keywords loaded. Please add keywords to the [KEYWORDS] section in config.ini.")
-        sys.exit(1)
-    
-    info_logger.info(f"📋 Loaded {len(original_keywords)} keywords")
-    
+
+    keywords_map = load_keywords_from_db(conn)
+    if not keywords_map:
+        send_telegram_message(
+            "⚠️ Nenhuma keyword cadastrada.\n\n"
+            "Use /addkeyword &lt;keyword&gt; = &lt;label&gt; para adicionar."
+        )
+        info_logger.info("No keywords in DB yet — bot will wait for /addkeyword commands.")
+
+    info_logger.info(f"📋 {len(keywords_map)} keyword(s) loaded from DB")
+
     # Get exchange rate with fallback
     rate = get_exchange_rate_with_fallback()
     buyee_session = create_buyee_session()
+    telegram_offset = 0
 
     schedule.every().day.at(DAILY_SUMMARY_TIME).do(send_daily_summary)
 
     try:
         while True:
-            for kw_original in original_keywords:
+            # Process any pending Telegram commands first
+            telegram_offset = check_telegram_commands(conn, telegram_offset)
+
+            # Reload keywords each cycle so additions/removals apply immediately
+            keywords_map = load_keywords_from_db(conn)
+
+            for kw_original, kw_translated in keywords_map.items():
                 try:
-                    kw_translated = keywords_map.get(kw_original, kw_original)
                     info_logger.info(f"🔍 Starting search for keyword: {kw_original} (Translated: {kw_translated})")
                     items = fetch_items(kw_original, conn, rate, session=buyee_session)
 
@@ -600,10 +714,9 @@ def main():
                             send_telegram_photo(title, url, image_url, formatted_price, keyword_label=kw_translated)
                     else:
                         logging.info(f"No new items found for keyword: {kw_original}")
-                        
+
                 except Exception as e:
                     logging.error(f"Error processing keyword '{kw_original}': {e}")
-                    # Continue with next keyword instead of crashing
                     continue
 
                 time.sleep(KEYWORD_BATCH_DELAY)
@@ -658,7 +771,7 @@ def validate_config():
     if not os.path.exists(config_path):
         raise ValueError(f"Configuration file '{config_path}' not found")
 
-    required_sections = ['BOT_SETTINGS', 'SCHEDULE', 'DELAYS', 'KEYWORDS']
+    required_sections = ['BOT_SETTINGS', 'SCHEDULE', 'DELAYS']
     for section in required_sections:
         if not config.has_section(section):
             raise ValueError(f"Missing required section: {section}")
