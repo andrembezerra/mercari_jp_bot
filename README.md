@@ -1,79 +1,49 @@
 # Mercari Telegram Bot
 
-This bot monitors Mercari Japan for new listings based on your specified keywords and sends notifications to a Telegram chat. It also tracks seen items to avoid duplicate notifications and provides daily summaries.
+This bot monitors Mercari Japan for new listings based on your specified keywords and sends notifications to a Telegram chat. It tracks seen items in a SQLite database to avoid duplicate notifications and supports on-demand summaries via Telegram commands.
 
 ## Features
 - Monitors Mercari Japan for new item listings.
 - Sends Telegram messages with item details, including title, price, image, and URL.
-- Tracks seen items to prevent duplicate notifications.
-- Supports price conversion from USD to JPY.
-- Provides daily summaries of new items found.
-- Configurable via environment variables and a dedicated configuration file.
+- Tracks seen items in a **SQLite database** (WAL mode) to prevent duplicate notifications — crash-safe and persistent.
+- Manages keywords at runtime via **Telegram commands** — no need to edit config files.
+- On-demand `/summary` command with filtering by period and keyword.
+- Supports price conversion from JPY to USD.
+- Configurable via environment variables and `config.ini`.
 
 ## Prerequisites
-Before running the bot, ensure you have the following installed:
 - **Python 3.8+**
-- **Google Chrome Browser** (Selenium requires a Chrome installation)
 
 ## Installation
-1.  **Create a project directory:**
-    ```bash
-    mkdir mercari_bot
-    cd mercari_bot
-    ```
-2.  **Save the script:**
-    Save the provided `mercari_telegram_bot_config_improved.py` file into this directory.
 
-3.  **Install Python dependencies:**
-    It's highly recommended to use a virtual environment.
+1. **Clone or download the repository.**
+
+2. **Install Python dependencies** (virtual environment recommended):
     ```bash
     python3 -m venv venv
-    source venv/bin/activate  # On Windows, use `venv\Scripts\activate`
+    source venv/bin/activate  # On Windows: venv\Scripts\activate
     pip install -r requirements.txt
     ```
-    The `requirements.txt` file lists all the Python packages your script needs to run. The `pip install -r requirements.txt` command tells `pip` to read this file and install all the listed dependencies automatically.
 
 ## Configuration
 
-### 1. `requirements.txt`
-Create a file named `requirements.txt` in your project directory with the following content:
-
-```
-python-dotenv
-requests
-schedule
-selenium
-webdriver-manager
-```
-
-### 2. `key.env`
-Create a file named `key.env` in your project directory. This file will store your Telegram bot token and chat ID. Replace `YOUR_BOT_TOKEN` and `YOUR_CHAT_ID` with your actual values.
+### `key.env`
+Create a `key.env` file with your Telegram credentials:
 
 ```
 BOT_TOKEN=YOUR_BOT_TOKEN
 CHAT_ID=YOUR_CHAT_ID
 ```
 
-*   **How to get `BOT_TOKEN`:**
-    *   Talk to BotFather on Telegram (`@BotFather`).
-    *   Send `/newbot` and follow the instructions to create a new bot.
-    *   BotFather will give you a token (e.g., `123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11`).
+- **`BOT_TOKEN`**: Create a bot via `@BotFather` on Telegram (`/newbot`).
+- **`CHAT_ID`**: Start a chat with your bot, then visit `https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates` and find the `id` field inside the `chat` object.
 
-*   **How to get `CHAT_ID`:**
-    *   Start a chat with your newly created bot.
-    *   Go to `https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates` in your web browser (replace `<YOUR_BOT_TOKEN>` with your bot's token).
-    *   Look for the `chat` object and find the `id` field. This is your `CHAT_ID`.
-
-### 3. `config.ini`
-Create a file named `config.ini` in your project directory with the following content. This file centralizes various bot settings.
+### `config.ini`
+Create a `config.ini` file. The `[KEYWORDS]` section is optional — keywords can be managed entirely via Telegram commands.
 
 ```ini
 [BOT_SETTINGS]
 MAX_SEEN_ITEMS = 1000
-SEEN_FILE = seen_items.json
-
-[SCHEDULE]
-DAILY_SUMMARY_TIME = 12:30
 
 [DELAYS]
 KEYWORD_BATCH_DELAY = 10
@@ -81,47 +51,55 @@ FULL_CYCLE_DELAY = 60
 
 [KEYWORDS]
 Nintendo Switch = Nintendo Switch
-Pokemon Cards = Pokemon Cards
-Japanese Books = Japanese Books
+ポケモンカード = Pokemon Cards
 ```
 
-*   **`MAX_SEEN_ITEMS`**: The maximum number of seen items to keep track of.
-*   **`SEEN_FILE`**: The name of the JSON file used to store seen items.
-*   **`KEYWORDS`**: This section contains the keywords for Mercari searches. Each entry should be in the format `Original Keyword = English Translation`. The bot will use the original keyword for searching Mercari and the English translation for Telegram messages. For example:
-    ```ini
-    [KEYWORDS]
-    Nintendo Switch = Nintendo Switch
-    ポケモンカード = Pokemon Cards
-    日本の本 = Japanese Books
-    ```
-    If the original keyword is already in English, you can simply repeat it as the translation.
-*   **`DAILY_SUMMARY_TIME`**: The time (in HH:MM format) when the daily summary will be sent.
-*   **`KEYWORD_BATCH_DELAY`**: The delay in seconds between processing different keywords.
-*   **`FULL_CYCLE_DELAY`**: The delay in seconds after a full cycle of all keywords is completed.
-
+- **`KEYWORD_BATCH_DELAY`**: Seconds between processing each keyword.
+- **`FULL_CYCLE_DELAY`**: Seconds to wait after completing a full cycle.
+- **`[KEYWORDS]`**: Optional. Each line is `Search Term = English Label`. On first boot, keywords are imported from here into the SQLite database. After that, use Telegram commands to manage them.
 
 ## Running the Bot
 
-1.  **Activate your virtual environment (if you created one):**
-    ```bash
-    source venv/bin/activate  # On Windows, use `venv\Scripts\activate`
-    ```
+```bash
+source venv/bin/activate
+python mercari_telegram_bot_config_improved.py
+```
 
-2.  **Run the bot:**
-    ```bash
-    python mercari_telegram_bot_config_improved.py
-    ```
+The bot runs continuously, polling Mercari and responding to Telegram commands each cycle.
 
-The bot will start fetching items and sending notifications to your Telegram chat. It is designed to run continuously.
+## Telegram Commands
+
+| Command | Description |
+|---|---|
+| `/help` | List all available commands |
+| `/keywords` | List all active keywords |
+| `/addkeyword <term> = <label>` | Add or update a keyword |
+| `/removekeyword <term>` | Remove a keyword |
+| `/summary` | Summary of all notifications in the last 24h |
+| `/summary 3d` / `7d` / `30d` | Summary for the chosen period |
+| `/summary <label>` | Summary for a specific keyword label (last 24h) |
+| `/summary <label> 7d` | Summary for a specific keyword label and period |
+
+Commands are only accepted from the authorised `CHAT_ID`.
+
+## Data Storage
+
+All persistent state is kept in **`seen_items.db`** (SQLite):
+
+- `seen_items` — items already notified, preventing duplicates.
+- `keywords` — active search keywords and their labels.
+- `notifications` — log of every notification sent (used by `/summary`).
+
+On first boot, if a legacy `seen_items.json` file exists, it is automatically migrated to the database.
 
 ## Important Notes
--   The bot uses Selenium to scrape Mercari, which requires a Chrome browser installation on the machine where the bot is running.
--   The `seen_items.json` file will be created automatically to store information about items that have already been seen. Do not delete this file unless you want to receive notifications for previously seen items again.
--   The exchange rate is fetched from `open.er-api.com`. If this API is unavailable, a fallback rate of 145.0 JPY to 1 USD will be used.
+- The `seen_items.db` file is created automatically. Do not delete it unless you want to receive duplicate notifications for previously seen items.
+- The exchange rate is fetched from `open.er-api.com`. A fallback rate of 145.0 JPY/USD is used if the API is unavailable.
+- The `[SCHEDULE]` / `DAILY_SUMMARY_TIME` config options have been removed. Use `/summary` instead.
 
 ## Troubleshooting
--   **`WebDriver could not initialize`**: Ensure Google Chrome is installed and accessible by the system. Also, check your internet connection.
--   **`Missing Telegram credentials`**: Double-check your `key.env` file for correct `BOT_TOKEN` and `CHAT_ID` values.
--   **`Configuration file not found`**: Ensure `config.ini` is present in the same directory as the script.
--   **No items found/sent**: Verify your keywords in the `[KEYWORDS]` section of `config.ini` are correct and that there are active listings on Mercari for those keywords.
--   **`JSONDecodeError`**: If `seen_items.json` becomes corrupted, delete it. The bot will create a new, empty one on the next run.
+
+- **`Missing Telegram credentials`**: Check your `key.env` file for correct `BOT_TOKEN` and `CHAT_ID`.
+- **`Configuration file not found`**: Ensure `config.ini` is in the same directory as the script.
+- **No items found/sent**: Verify your keywords are correct (use `/keywords` to list them) and that there are active listings on Mercari.
+- **No keywords loaded**: If the bot starts with no keywords, it will send a warning via Telegram. Use `/addkeyword` to add at least one.

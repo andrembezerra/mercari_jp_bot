@@ -2,31 +2,18 @@ import time
 import json
 import os
 import re
+import sqlite3
 import urllib.parse
 import requests
 import logging
 import sys
 import datetime
-import hashlib
-from collections import defaultdict
 
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 import configparser
 import asyncio
 from urllib.parse import urljoin
-
-try:
-    import schedule
-except ModuleNotFoundError:
-    class _ScheduleFallback:
-        def every(self):
-            raise RuntimeError("The 'schedule' package is required to run the bot")
-
-        def run_pending(self):
-            return None
-
-    schedule = _ScheduleFallback()
 
 try:
     import psutil
@@ -55,13 +42,12 @@ if os.path.exists(config_path):
     config.read(config_path, encoding='utf-8')
 
 # General Settings
-MAX_SEEN_ITEMS = config.getint('BOT_SETTINGS', 'MAX_SEEN_ITEMS', fallback=6000) if config.has_section('BOT_SETTINGS') else 6000
-seen_file_name = config.get('BOT_SETTINGS', 'SEEN_FILE', fallback='seen_items.json') if config.has_section('BOT_SETTINGS') else 'seen_items.json'
-SEEN_FILE = os.path.join(os.path.dirname(__file__), seen_file_name)
+db_file_name = config.get('BOT_SETTINGS', 'DB_FILE', fallback='seen_items.db') if config.has_section('BOT_SETTINGS') else 'seen_items.db'
+DB_FILE = os.path.join(os.path.dirname(__file__), db_file_name)
+# Legacy JSON path — used only for one-time migration on first run
+SEEN_FILE = os.path.join(os.path.dirname(__file__), 'seen_items.json')
 
 # Schedule Settings
-DAILY_SUMMARY_TIME = config.get('SCHEDULE', 'DAILY_SUMMARY_TIME', fallback='12:30') if config.has_section('SCHEDULE') else '12:30'
-
 # Delay Settings
 KEYWORD_BATCH_DELAY = config.getint('DELAYS', 'KEYWORD_BATCH_DELAY', fallback=10) if config.has_section('DELAYS') else 10
 FULL_CYCLE_DELAY = config.getint('DELAYS', 'FULL_CYCLE_DELAY', fallback=60) if config.has_section('DELAYS') else 60
@@ -82,7 +68,6 @@ info_logger.addHandler(handler)
 info_logger.propagate = False  # Prevent duplicate messages
 
 # --- Global Variables --- #
-daily_counts = defaultdict(int)
 translator = Translator()
 
 # Create a single event loop for translations
@@ -174,10 +159,11 @@ def send_telegram_message(text: str):
     except requests.exceptions.RequestException as e:
         logging.error(f"Failed to send message: {e}")
 
-def send_telegram_photo(title: str, url: str, img_url: str, price: str, timestamp: str):
+def send_telegram_photo(title: str, url: str, img_url: str, price: str, keyword_label: str = ""):
     """Sends a photo with a caption to the configured Telegram chat."""
     api_url = f'https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto'
-    caption = f"<b>{title}</b>\nPrice: {price}\nTime: {timestamp}\n{url}"
+    keyword_line = f"\nKeyword: {keyword_label}" if keyword_label else ""
+    caption = f"<b>{title}</b>\nPrice: {price}{keyword_line}\n{url}"
     payload = {
         'chat_id': CHAT_ID,
         'photo': img_url,
@@ -312,6 +298,7 @@ def _extract_items_from_search_html(soup: BeautifulSoup, keyword: str) -> list:
                 item_url = urljoin('https://buyee.jp', item_url)
 
             title_element = item_element.find(['h2', 'span'], class_=re.compile(r'(^| )(name|simple_name__)'))
+            # Keep raw Japanese title — translation happens later, only for new items
             title = title_element.get_text(strip=True) if title_element else "No title"
 
             price_element = item_element.find(['p', 'span'], class_=re.compile(r'(^| )(price|simple_price__)'))
@@ -320,10 +307,14 @@ def _extract_items_from_search_html(soup: BeautifulSoup, keyword: str) -> list:
             img_element = item_element.find('img')
             image_url = _extract_image_url(img_element)
 
+            # Use Mercari item ID from URL as the stable unique identifier
             item_id = item_url.split('/')[-1].split('?')[0] if item_url else ""
+            if not item_id:
+                continue
+
             items.append({
                 'id': item_id,
-                'title': translate_title_with_fallback(title),
+                'title': title,
                 'price': price_text,
                 'url': item_url,
                 'image_url': image_url,
@@ -336,7 +327,7 @@ def _extract_items_from_search_html(soup: BeautifulSoup, keyword: str) -> list:
     return items
 
 
-def fetch_items(keyword: str, seen_items: dict, rate: float, session=None) -> list:
+def fetch_items(keyword: str, conn: sqlite3.Connection, rate: float, session=None) -> list:
     """Fetches new items from Buyee for a given keyword using a shared session."""
     encoded_keyword = urllib.parse.quote(keyword)
     search_url = (
@@ -374,41 +365,50 @@ def fetch_items(keyword: str, seen_items: dict, rate: float, session=None) -> li
     new_items = []
     for item in items:
         try:
+            # Use Mercari item ID as the stable unique key
+            item_id = item['id']
+
             # Convert price to numeric value for comparison
             formatted_price, numeric_price = convert_price_to_yen(item['price'], rate)
             logging.debug(f"Processing item: {item['title']} | Raw price: {item['price']} | Formatted: {formatted_price} | Numeric: {numeric_price}")
-            
+
             if not formatted_price or not numeric_price:
                 logging.debug(f"Skipping item due to price conversion issue: {item['title']} (Price text: {item['price']})")
                 continue
-                
+
             if not item['url'] or not item['image_url']:
                 logging.debug(f"Skipping item due to missing URL or image: {item['title']}")
                 continue
-                
-            # Create unique signature for item
-            item_signature = hashlib.md5((item['title'].lower() + item['image_url']).encode()).hexdigest()
-            logging.debug(f"Item signature: {item_signature}")
+
             timestamp = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            
-            # Check if item is new or if a lower price is found
-            if item_signature not in seen_items:
+            row = get_seen_item(conn, item_id)
+
+            if row is None:
+                # New item — translate only now to avoid wasted API calls
+                display_title = translate_title_with_fallback(item['title'])
                 logging.debug(f"Item is new: {item['title']}")
-                new_items.append((item['title'], item['url'], item['image_url'], formatted_price, timestamp))
-                seen_items[item_signature] = {
-                    'price': numeric_price,
-                    'timestamp': timestamp
-                }
+                new_items.append({
+                    'title': display_title, 'url': item['url'],
+                    'image_url': item['image_url'], 'price': formatted_price,
+                    'item_id': item_id, 'numeric_price': numeric_price,
+                    'keyword': keyword, 'timestamp': timestamp,
+                })
+                upsert_seen_item(conn, item_id, numeric_price, timestamp, title=item['title'], url=item['url'])
                 info_logger.info(f"New item found: {item['title']} at {formatted_price}")
-            elif numeric_price < seen_items[item_signature]['price']:
-                logging.debug(f"Item is cheaper than before: {item['title']} | Old price: {seen_items[item_signature]['price']} | New price: {numeric_price}")
-                new_items.append((item['title'], item['url'], item['image_url'], formatted_price, timestamp))
-                seen_items[item_signature]['price'] = numeric_price
-                seen_items[item_signature]['timestamp'] = timestamp
+            elif numeric_price < row[0]:
+                display_title = translate_title_with_fallback(item['title'])
+                logging.debug(f"Item is cheaper: {item['title']} | Old: {row[0]} | New: {numeric_price}")
+                new_items.append({
+                    'title': display_title, 'url': item['url'],
+                    'image_url': item['image_url'], 'price': formatted_price,
+                    'item_id': item_id, 'numeric_price': numeric_price,
+                    'keyword': keyword, 'timestamp': timestamp,
+                })
+                upsert_seen_item(conn, item_id, numeric_price, timestamp, title=item['title'], url=item['url'])
                 info_logger.info(f"Cheaper item found: {item['title']} at {formatted_price}")
             else:
-                logging.debug(f"Item already seen or not cheaper: {item['title']} | Old price: {seen_items[item_signature]['price']} | New price: {numeric_price}")
-                
+                logging.debug(f"Item already seen: {item['title']} | Stored: {row[0]} | Current: {numeric_price}")
+
         except Exception as e:
             logging.warning(f"Error processing item: {e}")
             continue
@@ -434,33 +434,307 @@ def load_keywords() -> dict:
         logging.critical("No [KEYWORDS] section found in config.ini.")
         return {}
 
-def load_seen_items() -> dict:
-    """Loads seen items from the JSON file."""
-    if os.path.exists(SEEN_FILE):
-        try:
-            with open(SEEN_FILE, 'r', encoding='utf-8') as f:
-                seen_data = json.load(f)
-            logging.info(f"Loaded {len(seen_data)} seen items.")
-            return seen_data
-        except json.JSONDecodeError as e:
-            logging.error(f"Error decoding JSON from '{SEEN_FILE}': {e}. Starting with empty seen items.")
-            return {}
-        except Exception as e:
-            logging.error(f"Error loading seen items from '{SEEN_FILE}': {e}. Starting with empty seen items.")
-            return {}
-    logging.info("No seen items file found. Starting fresh.")
-    return {}
-
-def save_seen_items(seen_items: dict):
-    """Saves seen items to the JSON file, trimming to MAX_SEEN_ITEMS."""
-    # Keep only the most recent MAX_SEEN_ITEMS
-    trimmed_items = dict(list(seen_items.items())[-MAX_SEEN_ITEMS:])
+def _migrate_json_to_db(conn: sqlite3.Connection):
+    """One-time import of seen_items.json into the DB, then renames the file."""
+    if not os.path.exists(SEEN_FILE):
+        return
     try:
-        with open(SEEN_FILE, 'w', encoding='utf-8') as f:
-            json.dump(trimmed_items, f, ensure_ascii=False, indent=2)
-        logging.info(f"Saved {len(trimmed_items)} seen items to '{SEEN_FILE}'.")
+        with open(SEEN_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        rows = [
+            (item_id,
+             info.get('price', 0),
+             info.get('timestamp', now),
+             info.get('timestamp', now))
+            for item_id, info in data.items()
+            if isinstance(info, dict)
+        ]
+        conn.executemany(
+            "INSERT OR IGNORE INTO seen_items (item_id, price, first_seen, last_seen) VALUES (?,?,?,?)",
+            rows
+        )
+        conn.commit()
+        os.rename(SEEN_FILE, SEEN_FILE + '.migrated')
+        info_logger.info(f"Migrated {len(rows)} items from seen_items.json → seen_items.db")
     except Exception as e:
-        logging.error(f"Failed to save seen items: {e}")
+        logging.warning(f"JSON migration failed (non-fatal): {e}")
+
+
+def _migrate_keywords_to_db(conn: sqlite3.Connection):
+    """One-time import of keywords from config.ini [KEYWORDS] into the DB."""
+    existing = conn.execute("SELECT COUNT(*) FROM keywords").fetchone()[0]
+    if existing > 0:
+        return  # Already populated — skip
+    try:
+        keywords_dict = dict(config.items('KEYWORDS'))
+        rows = [(kw, label) for kw, label in keywords_dict.items()]
+        if rows:
+            conn.executemany(
+                "INSERT OR IGNORE INTO keywords (keyword, label) VALUES (?,?)", rows
+            )
+            conn.commit()
+            info_logger.info(f"Migrated {len(rows)} keywords from config.ini to DB")
+    except configparser.NoSectionError:
+        pass
+
+
+def init_db() -> sqlite3.Connection:
+    """Open (or create) the SQLite DB, enable WAL mode, create tables, run migrations."""
+    conn = sqlite3.connect(DB_FILE)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS seen_items (
+            item_id    TEXT    PRIMARY KEY,
+            price      INTEGER NOT NULL,
+            title      TEXT,
+            url        TEXT,
+            first_seen TEXT    NOT NULL,
+            last_seen  TEXT    NOT NULL
+        )
+    """)
+    # Migrate existing DBs that lack the new columns
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(seen_items)")}
+    if 'title' not in existing_cols:
+        conn.execute("ALTER TABLE seen_items ADD COLUMN title TEXT")
+    if 'url' not in existing_cols:
+        conn.execute("ALTER TABLE seen_items ADD COLUMN url TEXT")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS keywords (
+            keyword TEXT PRIMARY KEY,
+            label   TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS notifications (
+            id       INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id  TEXT    NOT NULL,
+            keyword  TEXT    NOT NULL,
+            price    INTEGER NOT NULL,
+            title    TEXT,
+            url      TEXT,
+            sent_at  TEXT    NOT NULL
+        )
+    """)
+    # Migrate existing DBs that lack the new columns
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(notifications)")}
+    if 'title' not in existing_cols:
+        conn.execute("ALTER TABLE notifications ADD COLUMN title TEXT")
+    if 'url' not in existing_cols:
+        conn.execute("ALTER TABLE notifications ADD COLUMN url TEXT")
+    conn.commit()
+    _migrate_json_to_db(conn)
+    _migrate_keywords_to_db(conn)
+    item_count = conn.execute("SELECT COUNT(*) FROM seen_items").fetchone()[0]
+    kw_count = conn.execute("SELECT COUNT(*) FROM keywords").fetchone()[0]
+    info_logger.info(f"DB ready at {DB_FILE} ({item_count} items tracked, {kw_count} keywords)")
+    return conn
+
+
+def get_seen_item(conn: sqlite3.Connection, item_id: str):
+    """Return (price, first_seen) tuple or None if not seen before."""
+    return conn.execute(
+        "SELECT price, first_seen FROM seen_items WHERE item_id = ?",
+        (item_id,)
+    ).fetchone()
+
+
+def upsert_seen_item(conn: sqlite3.Connection, item_id: str, price: int, timestamp: str,
+                     title: str = None, url: str = None):
+    """Insert new item or update price, title, url and last_seen for an existing item."""
+    conn.execute("""
+        INSERT INTO seen_items (item_id, price, title, url, first_seen, last_seen)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(item_id) DO UPDATE SET
+            price     = excluded.price,
+            title     = excluded.title,
+            url       = excluded.url,
+            last_seen = excluded.last_seen
+    """, (item_id, price, title, url, timestamp, timestamp))
+    conn.commit()
+
+# --- Keyword Management --- #
+def load_keywords_from_db(conn: sqlite3.Connection) -> dict:
+    """Returns {keyword: label} dict from the DB."""
+    rows = conn.execute("SELECT keyword, label FROM keywords").fetchall()
+    return {kw: label for kw, label in rows}
+
+
+def _cmd_list_keywords(conn: sqlite3.Connection):
+    kws = load_keywords_from_db(conn)
+    if not kws:
+        send_telegram_message("Nenhuma keyword cadastrada.\n\nUse /addkeyword &lt;keyword&gt; = &lt;label&gt;")
+        return
+    lines = ["📋 <b>Keywords ativas:</b>"]
+    for kw, label in kws.items():
+        lines.append(f"• {kw} = {label}")
+    send_telegram_message("\n".join(lines))
+
+
+def _cmd_add_keyword(conn: sqlite3.Connection, args: str):
+    if "=" in args:
+        parts = args.split("=", 1)
+        keyword = parts[0].strip()
+        label = parts[1].strip()
+    else:
+        keyword = args.strip()
+        label = keyword
+    if not keyword:
+        send_telegram_message("❌ Uso: /addkeyword &lt;keyword&gt; = &lt;label&gt;")
+        return
+    conn.execute("INSERT OR REPLACE INTO keywords (keyword, label) VALUES (?,?)", (keyword, label))
+    conn.commit()
+    send_telegram_message(f"✅ Keyword adicionada: <b>{keyword}</b> = {label}")
+    info_logger.info(f"Keyword added via Telegram: {keyword} = {label}")
+
+
+def _cmd_remove_keyword(conn: sqlite3.Connection, keyword: str):
+    if not keyword:
+        send_telegram_message("❌ Uso: /removekeyword &lt;keyword&gt;")
+        return
+    cur = conn.execute("DELETE FROM keywords WHERE keyword = ?", (keyword,))
+    conn.commit()
+    if cur.rowcount:
+        send_telegram_message(f"🗑 Keyword removida: <b>{keyword}</b>")
+        info_logger.info(f"Keyword removed via Telegram: {keyword}")
+    else:
+        send_telegram_message(f"❌ Keyword não encontrada: <b>{keyword}</b>")
+
+
+# --- Summary Command --- #
+_PERIOD_LABELS = {
+    '24h': ('últimas 24h', 1),
+    '3d':  ('últimos 3 dias', 3),
+    '7d':  ('últimos 7 dias', 7),
+    '30d': ('últimos 30 dias', 30),
+}
+_DEFAULT_PERIOD = '24h'
+
+
+def _cmd_summary(conn: sqlite3.Connection, args: str):
+    """
+    /summary               → all keywords, last 24h
+    /summary 7d            → all keywords, last 7 days
+    /summary IKKI          → keyword label "IKKI", last 24h
+    /summary IKKI 7d       → keyword label "IKKI", last 7 days
+    """
+    parts = args.strip().split()
+    period_key = _DEFAULT_PERIOD
+    label_filter = None
+
+    # Parse optional period token (last token if it matches a known period)
+    if parts and parts[-1].lower() in _PERIOD_LABELS:
+        period_key = parts[-1].lower()
+        parts = parts[:-1]
+
+    # Remaining tokens are a keyword label filter
+    if parts:
+        label_filter = " ".join(parts)
+
+    period_label, days = _PERIOD_LABELS[period_key]
+    since = (datetime.datetime.now() - datetime.timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+
+    if label_filter:
+        # Resolve label → keyword
+        row = conn.execute(
+            "SELECT keyword FROM keywords WHERE label = ? COLLATE NOCASE", (label_filter,)
+        ).fetchone()
+        if not row:
+            send_telegram_message(f"❌ Keyword com label <b>{label_filter}</b> não encontrada.\nUse /keywords para ver as ativas.")
+            return
+        kw_filter = row[0]
+        rows = conn.execute(
+            "SELECT keyword, COUNT(*) FROM notifications WHERE keyword = ? AND sent_at >= ? GROUP BY keyword",
+            (kw_filter, since)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT keyword, COUNT(*) FROM notifications WHERE sent_at >= ? GROUP BY keyword",
+            (since,)
+        ).fetchall()
+
+    title = f"📊 <b>Summary — {period_label}</b>"
+    if label_filter:
+        title += f" — {label_filter}"
+
+    if not rows:
+        send_telegram_message(f"{title}\n\nNenhum item encontrado nesse período.")
+        return
+
+    # Map keyword → label for display
+    kw_labels = load_keywords_from_db(conn)
+    lines = [title, ""]
+    total = 0
+    for kw, count in sorted(rows, key=lambda r: r[1], reverse=True):
+        lbl = kw_labels.get(kw, kw)
+        lines.append(f"• <b>{lbl}</b>: {count} item{'s' if count != 1 else ''}")
+        total += count
+
+    if not label_filter and len(rows) > 1:
+        lines.append(f"\nTotal: {total} items")
+
+    send_telegram_message("\n".join(lines))
+
+
+def _cmd_help():
+    send_telegram_message(
+        "🤖 <b>Comandos disponíveis</b>\n"
+        "\n"
+        "<b>Keywords</b>\n"
+        "/keywords — lista todas as keywords ativas\n"
+        "/addkeyword &lt;keyword&gt; = &lt;label&gt; — adiciona uma keyword\n"
+        "/removekeyword &lt;keyword&gt; — remove uma keyword\n"
+        "\n"
+        "<b>Summary</b>\n"
+        "/summary — todos os keywords, últimas 24h\n"
+        "/summary &lt;período&gt; — todos os keywords no período\n"
+        "/summary &lt;label&gt; — keyword específica, últimas 24h\n"
+        "/summary &lt;label&gt; &lt;período&gt; — keyword específica no período\n"
+        "\n"
+        "Períodos: <code>24h</code> · <code>3d</code> · <code>7d</code> · <code>30d</code>"
+    )
+
+
+# --- Telegram Command Polling --- #
+def check_telegram_commands(conn: sqlite3.Connection, offset: int) -> int:
+    """Poll getUpdates for new bot commands. Returns updated offset."""
+    try:
+        resp = requests.get(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
+            params={"offset": offset, "timeout": 0, "allowed_updates": ["message"]},
+            timeout=5
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        logging.warning(f"getUpdates failed: {e}")
+        return offset
+
+    for update in data.get("result", []):
+        offset = update["update_id"] + 1
+        msg = update.get("message", {})
+        chat_id = str(msg.get("chat", {}).get("id", ""))
+        text = msg.get("text", "").strip()
+
+        # Only process commands from the authorised chat
+        if chat_id != str(CHAT_ID):
+            logging.warning(f"Ignored command from unauthorised chat_id={chat_id}")
+            continue
+
+        if text == "/help":
+            _cmd_help()
+        elif text == "/keywords" or text.startswith("/keywords "):
+            _cmd_list_keywords(conn)
+        elif text.startswith("/addkeyword "):
+            _cmd_add_keyword(conn, text[len("/addkeyword "):].strip())
+        elif text.startswith("/removekeyword "):
+            _cmd_remove_keyword(conn, text[len("/removekeyword "):].strip())
+        elif text == "/summary" or text.startswith("/summary "):
+            _cmd_summary(conn, text[len("/summary"):].strip())
+
+    return offset
+
 
 # --- Exchange Rate --- #
 def get_usd_to_jpy_rate() -> float:
@@ -478,24 +752,6 @@ def get_usd_to_jpy_rate() -> float:
     except (KeyError, TypeError) as e:
         logging.warning(f"⚠️ Failed to parse exchange rate data, using fallback (145.0). Error: {e}")
         return 145.0
-
-# --- Daily Summary --- #
-def send_daily_summary():
-    """Sends a daily summary of new items found to Telegram."""
-    date = datetime.date.today().isoformat()
-    lines = [f"📊 Mercari Summary — {date}\n"]
-    if not daily_counts:
-        lines.append("No activity recorded today.")
-    else:
-        for kw_original, count in daily_counts.items():
-            # Assuming keywords_map is accessible or passed, or we re-load it
-            # For simplicity, let's re-load it here, or pass it as an argument
-            keywords_map = load_keywords() # Re-load for summary, or pass as arg
-            kw_translated = keywords_map.get(kw_original, kw_original) # Use original if translation not found
-            lines.append(f"• {kw_translated}: {count} new item{'s' if count != 1 else ''}")
-    send_telegram_message("\n".join(lines))
-    daily_counts.clear()
-    logging.info("Daily summary sent and daily counts cleared.")
 
 # --- Main Logic --- #
 def main():
@@ -517,63 +773,64 @@ def main():
     info_logger.info("🚀 Mercari bot is starting...")
     
     # Load data with error handling
+    conn = None
     try:
-        seen_items = load_seen_items()
-        keywords_map = load_keywords()
-        original_keywords = list(keywords_map.keys())
+        conn = init_db()
     except Exception as e:
-        logging.critical(f"Failed to load data: {e}")
+        logging.critical(f"Failed to initialise DB: {e}")
         sys.exit(1)
-    
-    if not original_keywords:
-        logging.critical("No keywords loaded. Please add keywords to the [KEYWORDS] section in config.ini.")
-        sys.exit(1)
-    
-    info_logger.info(f"📋 Loaded {len(original_keywords)} keywords")
-    
+
+    keywords_map = load_keywords_from_db(conn)
+    if not keywords_map:
+        send_telegram_message(
+            "⚠️ Nenhuma keyword cadastrada.\n\n"
+            "Use /addkeyword &lt;keyword&gt; = &lt;label&gt; para adicionar."
+        )
+        info_logger.info("No keywords in DB yet — bot will wait for /addkeyword commands.")
+
+    info_logger.info(f"📋 {len(keywords_map)} keyword(s) loaded from DB")
+
     # Get exchange rate with fallback
     rate = get_exchange_rate_with_fallback()
     buyee_session = create_buyee_session()
-
-    schedule.every().day.at(DAILY_SUMMARY_TIME).do(send_daily_summary)
+    telegram_offset = 0
 
     try:
         while True:
-            for kw_original in original_keywords:
+            # Process any pending Telegram commands first
+            telegram_offset = check_telegram_commands(conn, telegram_offset)
+
+            # Reload keywords each cycle so additions/removals apply immediately
+            keywords_map = load_keywords_from_db(conn)
+
+            for kw_original, kw_translated in keywords_map.items():
                 try:
-                    kw_translated = keywords_map.get(kw_original, kw_original)
                     info_logger.info(f"🔍 Starting search for keyword: {kw_original} (Translated: {kw_translated})")
-                    items = fetch_items(kw_original, seen_items, rate, session=buyee_session)
+                    items = fetch_items(kw_original, conn, rate, session=buyee_session)
 
                     if items:
-                        send_telegram_message(f"🔍 Found new listings for: <b>{kw_translated}</b>...")
-                        daily_counts[kw_original] += len(items)
-                        logging.info(f"🚀 Sending {len(items)} items for keyword: {kw_original}")
                         info_logger.info(f"Sending {len(items)} items to Telegram for keyword: {kw_original}")
-                        # Reverse the items list so newest items appear first in Telegram
+                        # Reverse so newest items appear first in Telegram
                         items.reverse()
                         for item in items:
-                            # item is a tuple: (title, url, image_url, formatted_price, timestamp)
-                            title, url, image_url, formatted_price, timestamp = item
-                            send_telegram_photo(title, url, image_url, formatted_price, timestamp)
-                        send_telegram_message(f"✅ Done! Found <b>{len(items)}</b> new item{'s' if len(items) != 1 else ''} for <b>{kw_translated}</b>.")
+                            send_telegram_photo(
+                                item['title'], item['url'], item['image_url'],
+                                item['price'], keyword_label=kw_translated
+                            )
+                            conn.execute(
+                                "INSERT INTO notifications (item_id, keyword, price, title, url, sent_at) VALUES (?,?,?,?,?,?)",
+                                (item['item_id'], kw_original, item['numeric_price'], item['title'], item['url'], item['timestamp'])
+                            )
+                        conn.commit()
                     else:
                         logging.info(f"No new items found for keyword: {kw_original}")
-                        
+
                 except Exception as e:
                     logging.error(f"Error processing keyword '{kw_original}': {e}")
-                    # Continue with next keyword instead of crashing
                     continue
 
                 time.sleep(KEYWORD_BATCH_DELAY)
 
-            # Save data periodically
-            try:
-                save_seen_items(seen_items)
-            except Exception as e:
-                logging.error(f"Failed to save seen items: {e}")
-            
-            schedule.run_pending()
             info_logger.info("✅ Finished a full cycle of keyword searches. Waiting for next cycle...")
             time.sleep(FULL_CYCLE_DELAY)
 
@@ -587,6 +844,8 @@ def main():
             logging.error("Failed to send error notification to Telegram")
         logging.error("Shutting down due to critical error.")
     finally:
+        if conn:
+            conn.close()
         try:
             send_telegram_message("🔴 Mercari bot has stopped.")
         except:
@@ -621,7 +880,7 @@ def validate_config():
     if not os.path.exists(config_path):
         raise ValueError(f"Configuration file '{config_path}' not found")
 
-    required_sections = ['BOT_SETTINGS', 'SCHEDULE', 'DELAYS', 'KEYWORDS']
+    required_sections = ['BOT_SETTINGS', 'DELAYS']
     for section in required_sections:
         if not config.has_section(section):
             raise ValueError(f"Missing required section: {section}")
