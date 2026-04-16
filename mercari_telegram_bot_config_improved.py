@@ -393,7 +393,7 @@ def fetch_items(keyword: str, conn: sqlite3.Connection, rate: float, session=Non
                     'item_id': item_id, 'numeric_price': numeric_price,
                     'keyword': keyword, 'timestamp': timestamp,
                 })
-                upsert_seen_item(conn, item_id, numeric_price, timestamp)
+                upsert_seen_item(conn, item_id, numeric_price, timestamp, title=item['title'], url=item['url'])
                 info_logger.info(f"New item found: {item['title']} at {formatted_price}")
             elif numeric_price < row[0]:
                 display_title = translate_title_with_fallback(item['title'])
@@ -404,7 +404,7 @@ def fetch_items(keyword: str, conn: sqlite3.Connection, rate: float, session=Non
                     'item_id': item_id, 'numeric_price': numeric_price,
                     'keyword': keyword, 'timestamp': timestamp,
                 })
-                upsert_seen_item(conn, item_id, numeric_price, timestamp)
+                upsert_seen_item(conn, item_id, numeric_price, timestamp, title=item['title'], url=item['url'])
                 info_logger.info(f"Cheaper item found: {item['title']} at {formatted_price}")
             else:
                 logging.debug(f"Item already seen: {item['title']} | Stored: {row[0]} | Current: {numeric_price}")
@@ -488,10 +488,18 @@ def init_db() -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS seen_items (
             item_id    TEXT    PRIMARY KEY,
             price      INTEGER NOT NULL,
+            title      TEXT,
+            url        TEXT,
             first_seen TEXT    NOT NULL,
             last_seen  TEXT    NOT NULL
         )
     """)
+    # Migrate existing DBs that lack the new columns
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(seen_items)")}
+    if 'title' not in existing_cols:
+        conn.execute("ALTER TABLE seen_items ADD COLUMN title TEXT")
+    if 'url' not in existing_cols:
+        conn.execute("ALTER TABLE seen_items ADD COLUMN url TEXT")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS keywords (
             keyword TEXT PRIMARY KEY,
@@ -504,9 +512,17 @@ def init_db() -> sqlite3.Connection:
             item_id  TEXT    NOT NULL,
             keyword  TEXT    NOT NULL,
             price    INTEGER NOT NULL,
+            title    TEXT,
+            url      TEXT,
             sent_at  TEXT    NOT NULL
         )
     """)
+    # Migrate existing DBs that lack the new columns
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(notifications)")}
+    if 'title' not in existing_cols:
+        conn.execute("ALTER TABLE notifications ADD COLUMN title TEXT")
+    if 'url' not in existing_cols:
+        conn.execute("ALTER TABLE notifications ADD COLUMN url TEXT")
     conn.commit()
     _migrate_json_to_db(conn)
     _migrate_keywords_to_db(conn)
@@ -524,15 +540,18 @@ def get_seen_item(conn: sqlite3.Connection, item_id: str):
     ).fetchone()
 
 
-def upsert_seen_item(conn: sqlite3.Connection, item_id: str, price: int, timestamp: str):
-    """Insert new item or update price and last_seen for an existing item."""
+def upsert_seen_item(conn: sqlite3.Connection, item_id: str, price: int, timestamp: str,
+                     title: str = None, url: str = None):
+    """Insert new item or update price, title, url and last_seen for an existing item."""
     conn.execute("""
-        INSERT INTO seen_items (item_id, price, first_seen, last_seen)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO seen_items (item_id, price, title, url, first_seen, last_seen)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(item_id) DO UPDATE SET
             price     = excluded.price,
+            title     = excluded.title,
+            url       = excluded.url,
             last_seen = excluded.last_seen
-    """, (item_id, price, timestamp, timestamp))
+    """, (item_id, price, title, url, timestamp, timestamp))
     conn.commit()
 
 # --- Keyword Management --- #
@@ -799,8 +818,8 @@ def main():
                                 item['price'], keyword_label=kw_translated
                             )
                             conn.execute(
-                                "INSERT INTO notifications (item_id, keyword, price, sent_at) VALUES (?,?,?,?)",
-                                (item['item_id'], kw_original, item['numeric_price'], item['timestamp'])
+                                "INSERT INTO notifications (item_id, keyword, price, title, url, sent_at) VALUES (?,?,?,?,?,?)",
+                                (item['item_id'], kw_original, item['numeric_price'], item['title'], item['url'], item['timestamp'])
                             )
                         conn.commit()
                     else:
