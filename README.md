@@ -62,7 +62,7 @@ Nintendo Switch = Nintendo Switch
 
 ```bash
 source venv/bin/activate
-python mercari_telegram_bot_config_improved.py
+python run_bot.py
 ```
 
 The bot runs continuously, polling Mercari and responding to Telegram commands each cycle.

@@ -10,4 +10,4 @@ services:
     volumes:
       - .:/app
     working_dir: /app
-    command: python mercari_telegram_bot_config_improved.py
+    command: python run_bot.py

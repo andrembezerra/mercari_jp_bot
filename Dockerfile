@@ -25,4 +25,4 @@ COPY . /app/
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Run bot script
-CMD ["python", "mercari_telegram_bot_config_improved.py"]
+CMD ["python", "run_bot.py"]
