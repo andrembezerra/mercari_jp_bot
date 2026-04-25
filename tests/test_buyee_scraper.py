@@ -6,16 +6,17 @@ from unittest import mock
 import requests
 from bs4 import BeautifulSoup
 
-import mercari_telegram_bot_config_improved as bot
+from src import scraper
 
 
 def make_test_db() -> sqlite3.Connection:
-    """Create an in-memory SQLite DB with the seen_items schema for tests."""
     conn = sqlite3.connect(":memory:")
     conn.execute("""
         CREATE TABLE seen_items (
             item_id    TEXT    PRIMARY KEY,
             price      INTEGER NOT NULL,
+            title      TEXT,
+            url        TEXT,
             first_seen TEXT    NOT NULL,
             last_seen  TEXT    NOT NULL
         )
@@ -58,7 +59,7 @@ class DummySession:
 
 class BuyeeScraperTests(unittest.TestCase):
     def test_create_buyee_session_sets_browser_headers(self):
-        session = bot.create_buyee_session()
+        session = scraper.create_buyee_session()
 
         self.assertEqual(session.headers["Referer"], "https://buyee.jp/mercari/")
         self.assertIn("Mozilla/5.0", session.headers["User-Agent"])
@@ -69,8 +70,7 @@ class BuyeeScraperTests(unittest.TestCase):
         html = FIXTURE_PATH.read_text(encoding="utf-8")
         soup = BeautifulSoup(html, "html.parser")
 
-        with mock.patch.object(bot, "translate_title_with_fallback", side_effect=lambda title: title):
-            items = bot._extract_items_from_search_html(soup, "test")
+        items = scraper.extract_items_from_search_html(soup, "test")
 
         self.assertEqual(len(items), 2)
         self.assertEqual(items[0]["id"], "m42393820957")
@@ -84,7 +84,7 @@ class BuyeeScraperTests(unittest.TestCase):
             DummyResponse(status_code=200, url="https://buyee.jp/mercari/search?keyword=test"),
         ])
 
-        response = bot.fetch_with_retry(session, "https://buyee.jp/mercari/search?keyword=test", delay=0)
+        response = scraper.fetch_with_retry(session, "https://buyee.jp/mercari/search?keyword=test", delay=0)
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(session.calls), 2)
@@ -95,7 +95,7 @@ class BuyeeScraperTests(unittest.TestCase):
         ])
 
         with self.assertRaises(requests.HTTPError):
-            bot.fetch_with_retry(session, "https://buyee.jp/mercari/search?keyword=test", max_retries=1, delay=0)
+            scraper.fetch_with_retry(session, "https://buyee.jp/mercari/search?keyword=test", max_retries=1, delay=0)
 
     def test_fetch_items_does_not_depend_on_iframe(self):
         html = FIXTURE_PATH.read_text(encoding="utf-8")
@@ -104,8 +104,9 @@ class BuyeeScraperTests(unittest.TestCase):
         ])
 
         conn = make_test_db()
-        with mock.patch.object(bot, "translate_title_with_fallback", side_effect=lambda title: title):
-            items = bot.fetch_items("test", conn, rate=145.0, session=session)
+        translator = mock.Mock()
+        translator.translate_title_with_fallback.side_effect = lambda title: title
+        items = scraper.fetch_items("test", conn, rate=145.0, translator=translator, session=session)
         conn.close()
 
         self.assertEqual(len(items), 2)

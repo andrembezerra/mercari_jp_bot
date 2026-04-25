@@ -1,10 +1,13 @@
 key.env
 *.env
 venv
+.venv
 *.log
 config.ini
 seen_items.json
 venv/
+__pycache__/
+*/__pycache__/
 *.json
 mercari-bot.service
 update_bot.sh
