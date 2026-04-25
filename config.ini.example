@@ -1,0 +1,10 @@
+[BOT_SETTINGS]
+MAX_SEEN_ITEMS = 1000
+
+[DELAYS]
+KEYWORD_BATCH_DELAY = 10
+FULL_CYCLE_DELAY = 60
+
+[KEYWORDS]
+Nintendo Switch = Nintendo Switch
+ポケモンカード = Pokemon Cards

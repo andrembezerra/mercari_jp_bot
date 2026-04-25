@@ -28,7 +28,13 @@ This bot monitors Mercari Japan for new listings based on your specified keyword
 ## Configuration
 
 ### `key.env`
-Create a `key.env` file with your Telegram credentials:
+Copy `key.env.example` to `key.env`, then add your Telegram credentials:
+
+```bash
+cp key.env.example key.env
+```
+
+`key.env` should contain:
 
 ```
 BOT_TOKEN=YOUR_BOT_TOKEN
@@ -39,7 +45,13 @@ CHAT_ID=YOUR_CHAT_ID
 - **`CHAT_ID`**: Start a chat with your bot, then visit `https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates` and find the `id` field inside the `chat` object.
 
 ### `config.ini`
-Create a `config.ini` file. The `[KEYWORDS]` section is optional — keywords can be managed entirely via Telegram commands.
+Copy `config.ini.example` to `config.ini`. The `[KEYWORDS]` section is optional — keywords can be managed entirely via Telegram commands.
+
+```bash
+cp config.ini.example config.ini
+```
+
+Example `config.ini`:
 
 ```ini
 [BOT_SETTINGS]
