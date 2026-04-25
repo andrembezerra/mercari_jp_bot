@@ -1,5 +1,6 @@
 import configparser
 import sqlite3
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,8 @@ from src.config import Settings
 from src.database import init_db
 from src.image_search import (
     OcrResult,
+    TesseractEngine,
+    _build_ocr_variants,
     normalize_ocr_tokens,
     run_image_search,
     run_ocr_pipeline,
@@ -23,6 +26,14 @@ class CannedEngine:
 
     def extract(self, image_bytes):
         return self.text
+
+
+class ErrorEngine:
+    def __init__(self, message):
+        self.last_error_message = message
+
+    def extract(self, image_bytes):
+        return ""
 
 
 class FakeClient:
@@ -82,6 +93,50 @@ class OcrPipelineTests(unittest.TestCase):
         self.assertEqual(result.selected_keyword, "任天堂スイッチ")
         self.assertIn("任天堂スイッチ", result.candidate_terms)
 
+    def test_run_pipeline_preserves_engine_error_message(self):
+        result = run_ocr_pipeline(
+            b"x",
+            engine=ErrorEngine("❌ OCR indisponível no momento."),
+        )
+        self.assertEqual(result.error_message, "❌ OCR indisponível no momento.")
+
+    def test_build_ocr_variants_returns_multiple_processed_images(self):
+        from PIL import Image, ImageFilter, ImageOps
+
+        image = Image.new("RGB", (120, 80), color="white")
+        variants = _build_ocr_variants(image, ImageOps, ImageFilter)
+
+        self.assertEqual(len(variants), 4)
+        self.assertTrue(all(variant.mode == "L" for variant in variants))
+        self.assertTrue(all(variant.width >= 240 for variant in variants))
+
+    def test_tesseract_engine_tries_multiple_attempts(self):
+        fake_pytesseract = mock.Mock()
+        fake_pytesseract.image_to_string.side_effect = [
+            "!!! ::: 12",
+            "任天堂スイッチ",
+        ]
+
+        with tempfile.NamedTemporaryFile(suffix=".png") as tmp:
+            from PIL import Image
+
+            Image.new("RGB", (40, 20), color="white").save(tmp.name)
+            tmp.seek(0)
+
+            fake_module = sys.modules.get("pytesseract")
+            sys.modules["pytesseract"] = fake_pytesseract
+            try:
+                engine = TesseractEngine()
+                text = engine.extract(Path(tmp.name).read_bytes())
+            finally:
+                if fake_module is None:
+                    sys.modules.pop("pytesseract", None)
+                else:
+                    sys.modules["pytesseract"] = fake_module
+
+        self.assertEqual(text, "任天堂スイッチ")
+        self.assertGreaterEqual(fake_pytesseract.image_to_string.call_count, 2)
+
 
 class ImageSearchOrchestratorTests(unittest.TestCase):
     def setUp(self):
@@ -129,6 +184,16 @@ class ImageSearchOrchestratorTests(unittest.TestCase):
             self.conn, _photo_ctx(), client, engine=CannedEngine("!!! ::: 12")
         )
         self.assertIn("OCR não encontrou", client.messages[0])
+
+    def test_ocr_dependency_error_is_reported_directly(self):
+        client = FakeClient()
+        run_image_search(
+            self.conn,
+            _photo_ctx(),
+            client,
+            engine=ErrorEngine("❌ OCR indisponível no momento."),
+        )
+        self.assertIn("OCR indisponível", client.messages[0])
 
     def test_full_flow_sends_results_and_suggestion(self):
         client = FakeClient()

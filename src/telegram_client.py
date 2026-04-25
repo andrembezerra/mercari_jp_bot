@@ -13,6 +13,7 @@ from src.commands import (
     cmd_list_keywords,
     cmd_pause,
     cmd_remove_keyword,
+    cmd_restart,
     cmd_resume,
     cmd_skip_keyword,
     cmd_skipped,
@@ -146,6 +147,8 @@ class TelegramClient:
             cmd_pause(conn, self.send_message)
         elif text == "/resume" or text.startswith("/resume "):
             cmd_resume(conn, self.send_message)
+        elif text == "/restart" or text.startswith("/restart "):
+            cmd_restart(self.send_message)
         elif text == "/status" or text.startswith("/status "):
             cmd_status(conn, self.send_message)
         elif text.startswith("/skipkeyword "):

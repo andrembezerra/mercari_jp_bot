@@ -5,12 +5,14 @@ import unittest
 from pathlib import Path
 
 from src.commands import (
+    RestartRequested,
     cmd_add_keyword,
     cmd_blocked,
     cmd_enable_keyword,
     cmd_hide,
     cmd_pause,
     cmd_remove_keyword,
+    cmd_restart,
     cmd_resume,
     cmd_skip_keyword,
     cmd_skipped,
@@ -179,6 +181,11 @@ class CommandTests(unittest.TestCase):
         self.messages.clear()
         cmd_status(self.conn, self.send_message)
         self.assertIn("pausado", self.messages[0])
+
+    def test_restart_requests_process_restart(self):
+        with self.assertRaises(RestartRequested):
+            cmd_restart(self.send_message)
+        self.assertIn("Reiniciando o bot", self.messages[0])
 
     # --- keyword control: /skipkeyword /enablekeyword /skipped ---
 

@@ -9,6 +9,7 @@ except ModuleNotFoundError:
     psutil = None
 
 from src.config import load_settings, validate_config
+from src.commands import RestartRequested
 from src.database import (
     init_db,
     insert_notification,
@@ -71,6 +72,7 @@ def main():
     translator = TranslationService()
     buyee_session = create_buyee_session()
     telegram_offset = 0
+    restart_requested = False
 
     try:
         while True:
@@ -154,6 +156,10 @@ def main():
             info_logger.info("✅ Finished a full cycle of keyword searches. Waiting for next cycle...")
             time.sleep(settings.full_cycle_delay)
 
+    except RestartRequested:
+        restart_requested = True
+        info_logger.info("🔄 Restart requested; exiting process for Docker restart policy.")
+        raise SystemExit(0)
     except KeyboardInterrupt:
         info_logger.info("🛑 Bot stopped by user (KeyboardInterrupt).")
     except Exception as exc:
@@ -166,8 +172,11 @@ def main():
     finally:
         if conn:
             conn.close()
-        try:
-            telegram.send_message("🔴 Mercari bot has stopped.")
-        except Exception:
-            logging.error("Failed to send shutdown notification to Telegram")
-        info_logger.info("🔴 Mercari bot is shutting down.")
+        if restart_requested:
+            info_logger.info("🔄 Mercari bot process exited for restart.")
+        else:
+            try:
+                telegram.send_message("🔴 Mercari bot has stopped.")
+            except Exception:
+                logging.error("Failed to send shutdown notification to Telegram")
+            info_logger.info("🔴 Mercari bot is shutting down.")

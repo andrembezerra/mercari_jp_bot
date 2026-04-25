@@ -6,5 +6,3 @@ KEYWORD_BATCH_DELAY = 10
 FULL_CYCLE_DELAY = 60
 
 [KEYWORDS]
-Nintendo Switch = Nintendo Switch
-ポケモンカード = Pokemon Cards

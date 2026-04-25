@@ -34,6 +34,7 @@ class OcrResult:
     raw_text: str
     candidate_terms: list[str] = field(default_factory=list)
     selected_keyword: str = ""
+    error_message: str = ""
 
 
 class OcrEngine(Protocol):
@@ -41,22 +42,73 @@ class OcrEngine(Protocol):
 
 
 class TesseractEngine:
+    def __init__(self) -> None:
+        self.last_error_message = ""
+
     def extract(self, image_bytes: bytes) -> str:
+        self.last_error_message = ""
         try:
             import io
 
             import pytesseract
-            from PIL import Image
+            from PIL import Image, ImageFilter, ImageOps
         except ImportError as exc:
             logging.error(f"OCR dependency missing: {exc}")
+            self.last_error_message = (
+                "❌ OCR indisponível no momento. Instale as dependências "
+                "(`pytesseract`, `Pillow`) e o Tesseract com japonês (`jpn`)."
+            )
             return ""
 
         try:
             image = Image.open(io.BytesIO(image_bytes))
-            return pytesseract.image_to_string(image, lang="jpn+eng")
+            variants = _build_ocr_variants(image, ImageOps, ImageFilter)
+            attempts = [
+                {"lang": "jpn+eng", "config": "--oem 3 --psm 6"},
+                {"lang": "jpn+eng", "config": "--oem 3 --psm 11"},
+                {"lang": "jpn+eng", "config": "--oem 3 --psm 12"},
+                {"lang": "eng", "config": "--oem 3 --psm 6"},
+            ]
+
+            best_text = ""
+            best_score = -1
+            for variant in variants:
+                for attempt in attempts:
+                    text = pytesseract.image_to_string(
+                        variant,
+                        lang=attempt["lang"],
+                        config=attempt["config"],
+                    )
+                    score = len(normalize_ocr_tokens(text))
+                    if score > best_score:
+                        best_text = text
+                        best_score = score
+                    if score >= 3:
+                        return text
+            return best_text
         except Exception as exc:
             logging.warning(f"Tesseract OCR failed: {exc}")
+            self.last_error_message = (
+                "❌ OCR falhou ao processar a imagem. Verifique se o Tesseract e "
+                "o pacote de idioma japonês (`jpn`) estão instalados."
+            )
             return ""
+
+
+def _build_ocr_variants(image, image_ops, image_filter) -> list:
+    image = image_ops.exif_transpose(image)
+    base = image.convert("L")
+
+    width, height = base.size
+    max_dim = max(width, height)
+    if max_dim and max_dim < 1800:
+        scale = max(2, int(1800 / max_dim))
+        base = base.resize((width * scale, height * scale))
+
+    sharpened = image_ops.autocontrast(base).filter(image_filter.SHARPEN)
+    thresholded = sharpened.point(lambda px: 255 if px > 170 else 0)
+    inverted = image_ops.invert(thresholded)
+    return [base, sharpened, thresholded, inverted]
 
 
 def normalize_ocr_tokens(text: str) -> list[str]:
@@ -100,7 +152,12 @@ def run_ocr_pipeline(image_bytes: bytes, engine: OcrEngine | None = None) -> Ocr
     raw_text = engine.extract(image_bytes)
     candidates = normalize_ocr_tokens(raw_text)
     selected = select_best_keyword(candidates)
-    return OcrResult(raw_text=raw_text, candidate_terms=candidates, selected_keyword=selected)
+    return OcrResult(
+        raw_text=raw_text,
+        candidate_terms=candidates,
+        selected_keyword=selected,
+        error_message=getattr(engine, "last_error_message", ""),
+    )
 
 
 def _suggest_label(keyword: str) -> str:
@@ -127,6 +184,9 @@ def run_image_search(
         return
 
     result = run_ocr_pipeline(image_bytes, engine=engine)
+    if result.error_message:
+        client.send_message(result.error_message)
+        return
     if not result.selected_keyword:
         client.send_message("❌ OCR não encontrou texto utilizável na imagem.")
         return

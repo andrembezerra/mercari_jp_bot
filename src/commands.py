@@ -33,6 +33,10 @@ _PERIOD_LABELS = {
 _DEFAULT_PERIOD = "24h"
 
 
+class RestartRequested(Exception):
+    pass
+
+
 def cmd_list_keywords(conn: sqlite3.Connection, send_message) -> None:
     kws = load_keywords_from_db(conn, include_disabled=True)
     if not kws:
@@ -202,6 +206,12 @@ def cmd_resume(conn: sqlite3.Connection, send_message) -> None:
     send_message("▶️ Bot retomado.")
 
 
+def cmd_restart(send_message) -> None:
+    info_logger.info("Bot restart requested via /restart")
+    send_message("🔄 Reiniciando o bot. O container deve voltar em alguns segundos.")
+    raise RestartRequested()
+
+
 def cmd_status(conn: sqlite3.Connection, send_message) -> None:
     paused = is_paused(conn)
     active_kw = len(load_keywords_from_db(conn))
@@ -303,6 +313,7 @@ def cmd_help(send_message) -> None:
         "/status — estado atual do bot\n"
         "/pause — pausa as notificações\n"
         "/resume — retoma o bot\n"
+        "/restart — reinicia o bot/container\n"
         "\n"
         "<b>Busca</b>\n"
         "/summary — resumo de notificações\n"

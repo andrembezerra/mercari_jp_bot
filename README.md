@@ -105,6 +105,7 @@ The bot runs continuously, polling Mercari and responding to Telegram commands e
 | `/status` | Compact bot status (paused, counts, last cycle, last error) |
 | `/pause` | Pause scraping; command polling stays active. Survives restarts. |
 | `/resume` | Resume scraping |
+| `/restart` | Restart the bot process. In Docker, `restart: unless-stopped` starts the container again automatically. |
 
 ### Search
 | Command | Description |
