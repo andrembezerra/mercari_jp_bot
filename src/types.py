@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from typing import TypedDict
 
 
@@ -19,4 +20,15 @@ class NotificationItem(TypedDict):
     numeric_price: int
     keyword: str
     timestamp: str
+
+
+@dataclass(frozen=True)
+class CommandContext:
+    chat_id: str
+    message_id: int | None
+    text: str
+    args: str
+    reply_to_message_id: int | None
+    photo_file_id: str | None
+    replied_photo_file_id: str | None
 

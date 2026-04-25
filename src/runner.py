@@ -9,7 +9,13 @@ except ModuleNotFoundError:
     psutil = None
 
 from src.config import load_settings, validate_config
-from src.database import init_db, insert_notification, load_keywords_from_db
+from src.database import (
+    init_db,
+    insert_notification,
+    is_paused,
+    load_keywords_from_db,
+    set_state,
+)
 from src.logging_setup import info_logger
 from src.pricing import ExchangeRateService
 from src.scraper import create_buyee_session, fetch_items
@@ -69,7 +75,15 @@ def main():
     try:
         while True:
             telegram_offset = telegram.check_commands(conn, telegram_offset)
+
+            if is_paused(conn):
+                logging.info("Bot is paused — skipping scrape cycle")
+                time.sleep(settings.keyword_batch_delay)
+                continue
+
             keywords_map = load_keywords_from_db(conn)
+            cycle_keywords = 0
+            cycle_items = 0
 
             for kw_original, kw_translated in keywords_map.items():
                 try:
@@ -90,7 +104,7 @@ def main():
                         )
                         items.reverse()
                         for item in items:
-                            telegram.send_photo(
+                            message_id = telegram.send_photo(
                                 item["title"],
                                 item["url"],
                                 item["image_url"],
@@ -105,17 +119,38 @@ def main():
                                 item["title"],
                                 item["url"],
                                 item["timestamp"],
+                                telegram_message_id=message_id,
                             )
+                            cycle_items += 1
+                            time.sleep(0.5)
                         conn.commit()
                     else:
                         logging.info(f"No new items found for keyword: {kw_original}")
 
+                    cycle_keywords += 1
+
                 except Exception as exc:
                     logging.error(f"Error processing keyword '{kw_original}': {exc}")
+                    set_state(
+                        conn,
+                        "last_error_at",
+                        time.strftime("%Y-%m-%d %H:%M:%S"),
+                    )
+                    set_state(
+                        conn,
+                        "last_error_summary",
+                        f"{type(exc).__name__} on '{kw_original}'",
+                    )
                     continue
 
                 time.sleep(settings.keyword_batch_delay)
 
+            set_state(conn, "last_cycle_at", time.strftime("%Y-%m-%d %H:%M:%S"))
+            set_state(
+                conn,
+                "last_cycle_summary",
+                f"{cycle_keywords} kw, {cycle_items} items",
+            )
             info_logger.info("✅ Finished a full cycle of keyword searches. Waiting for next cycle...")
             time.sleep(settings.full_cycle_delay)
 

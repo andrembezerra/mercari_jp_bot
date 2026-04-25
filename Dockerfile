@@ -13,6 +13,8 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 # Install minimal system dependencies
 RUN apt-get update && apt-get install -y \
     curl \
+    tesseract-ocr \
+    tesseract-ocr-jpn \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory

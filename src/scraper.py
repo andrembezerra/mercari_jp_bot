@@ -9,7 +9,7 @@ from urllib.parse import urljoin
 import requests
 from bs4 import BeautifulSoup
 
-from src.database import get_seen_item, upsert_seen_item
+from src.database import get_seen_item, is_item_suppressed, upsert_seen_item
 from src.logging_setup import info_logger
 from src.pricing import convert_price_to_yen
 from src.translation import TranslationService
@@ -182,6 +182,9 @@ def fetch_items(
     for item in items:
         try:
             item_id = item["id"]
+            if is_item_suppressed(conn, item_id):
+                logging.debug(f"Skipping suppressed item: {item_id}")
+                continue
             formatted_price, numeric_price = convert_price_to_yen(item["price"], rate)
             logging.debug(
                 f"Processing item: {item['title']} | Raw price: {item['price']} | "
@@ -242,6 +245,72 @@ def fetch_items(
         info_logger.info(f"📦 Found {len(new_items)} new/cheaper items for keyword: {keyword}")
 
     return new_items
+
+
+def fetch_items_one_off(
+    keyword: str,
+    rate: float,
+    translator: TranslationService,
+    session=None,
+    conn: sqlite3.Connection | None = None,
+    limit: int = 20,
+) -> list[NotificationItem]:
+    encoded_keyword = urllib.parse.quote(keyword)
+    search_url = (
+        f"https://buyee.jp/mercari/search?keyword={encoded_keyword}"
+        f"&order-sort=desc-created_time&status=on_sale"
+    )
+    session = session or create_buyee_session()
+
+    info_logger.info(f"🔎 One-off search: {keyword}")
+
+    try:
+        response = fetch_with_retry(session, search_url)
+    except requests.RequestException as exc:
+        logging.error(f"One-off search failed for keyword '{keyword}': {exc}")
+        return []
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    items = extract_items_from_search_html(soup, keyword)
+    if not items:
+        return []
+
+    results: list[NotificationItem] = []
+    for item in items:
+        if len(results) >= limit:
+            break
+        try:
+            item_id = item["id"]
+            if conn is not None and is_item_suppressed(conn, item_id):
+                logging.debug(f"Skipping suppressed item in one-off search: {item_id}")
+                continue
+            formatted_price, numeric_price = convert_price_to_yen(item["price"], rate)
+            if not formatted_price or not numeric_price:
+                continue
+            if not item["url"] or not item["image_url"]:
+                continue
+            display_title = translator.translate_title_with_fallback(item["title"])
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            results.append(
+                {
+                    "title": display_title,
+                    "url": item["url"],
+                    "image_url": item["image_url"],
+                    "price": formatted_price,
+                    "item_id": item_id,
+                    "numeric_price": numeric_price,
+                    "keyword": keyword,
+                    "timestamp": timestamp,
+                }
+            )
+        except Exception as exc:
+            logging.warning(f"Error processing one-off item: {exc}")
+            continue
+
+    info_logger.info(
+        f"One-off search returned {len(results)} item(s) for keyword: {keyword}"
+    )
+    return results
 
 
 def test_url_accessibility(url: str, timeout: int = 5) -> bool:

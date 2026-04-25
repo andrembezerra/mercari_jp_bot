@@ -69,26 +69,61 @@ The bot runs continuously, polling Mercari and responding to Telegram commands e
 
 ## Telegram Commands
 
+### Keywords
 | Command | Description |
 |---|---|
-| `/help` | List all available commands |
-| `/keywords` | List all active keywords |
+| `/keywords` | List all keywords (active + skipped) |
 | `/addkeyword <term> = <label>` | Add or update a keyword |
 | `/removekeyword <term>` | Remove a keyword |
-| `/summary` | Summary of all notifications in the last 24h |
+| `/skipkeyword <label or keyword>` | Temporarily disable a keyword |
+| `/enablekeyword <label or keyword>` | Re-enable a skipped keyword |
+| `/skipped` | List currently skipped keywords |
+
+### Item moderation (reply to a bot photo notification)
+| Command | Description |
+|---|---|
+| `/hide` | Permanently hide that item (reason: `hide`) |
+| `/wrong` | Permanently hide that item (reason: `wrong` — false match) |
+| `/unblock` | Remove suppression for that item |
+| `/blocked` | List currently blocked items |
+
+### Runtime control
+| Command | Description |
+|---|---|
+| `/status` | Compact bot status (paused, counts, last cycle, last error) |
+| `/pause` | Pause scraping; command polling stays active. Survives restarts. |
+| `/resume` | Resume scraping |
+
+### Search
+| Command | Description |
+|---|---|
+| `/summary` | Notifications in the last 24h |
 | `/summary 3d` / `7d` / `30d` | Summary for the chosen period |
 | `/summary <label>` | Summary for a specific keyword label (last 24h) |
 | `/summary <label> 7d` | Summary for a specific keyword label and period |
+| `/imagesearch` | Reply to a photo you sent the bot. Bot OCRs the image, runs one newest-first Mercari search, returns up to 20 items, then suggests one `/addkeyword` line. Does not auto-save. |
 
 Commands are only accepted from the authorised `CHAT_ID`.
+
+## OCR setup (for `/imagesearch`)
+
+`/imagesearch` requires Tesseract with the Japanese language pack installed locally.
+
+- **Docker:** the included `Dockerfile` already installs `tesseract-ocr` and `tesseract-ocr-jpn`.
+- **macOS:** `brew install tesseract tesseract-lang`
+- **Debian/Ubuntu:** `sudo apt-get install tesseract-ocr tesseract-ocr-jpn`
+
+The Python bindings (`pytesseract`, `Pillow`) are already in `requirements.txt`.
 
 ## Data Storage
 
 All persistent state is kept in **`seen_items.db`** (SQLite):
 
 - `seen_items` — items already notified, preventing duplicates.
-- `keywords` — active search keywords and their labels.
-- `notifications` — log of every notification sent (used by `/summary`).
+- `keywords` — search keywords and their labels (with `disabled_at` for `/skipkeyword`).
+- `notifications` — log of every notification sent (used by `/summary` and reply-based moderation).
+- `item_suppressions` — items hidden via `/hide` or `/wrong`.
+- `bot_state` — paused flag, last cycle, last error.
 
 On first boot, if a legacy `seen_items.json` file exists, it is automatically migrated to the database.
 

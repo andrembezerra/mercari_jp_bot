@@ -21,6 +21,17 @@ def make_test_db() -> sqlite3.Connection:
             last_seen  TEXT    NOT NULL
         )
     """)
+    conn.execute("""
+        CREATE TABLE item_suppressions (
+            item_id    TEXT PRIMARY KEY,
+            reason     TEXT NOT NULL,
+            title      TEXT,
+            url        TEXT,
+            keyword    TEXT,
+            created_at TEXT NOT NULL,
+            removed_at TEXT
+        )
+    """)
     conn.commit()
     return conn
 
@@ -110,6 +121,66 @@ class BuyeeScraperTests(unittest.TestCase):
         conn.close()
 
         self.assertEqual(len(items), 2)
+
+    def test_fetch_items_skips_suppressed_items(self):
+        html = FIXTURE_PATH.read_text(encoding="utf-8")
+        session = DummySession([
+            DummyResponse(status_code=200, url="https://buyee.jp/mercari/search?keyword=test", text=html),
+        ])
+        conn = make_test_db()
+        # Suppress the first fixture item (id m42393820957)
+        conn.execute(
+            "INSERT INTO item_suppressions (item_id, reason, title, url, keyword, created_at, removed_at) "
+            "VALUES (?, 'hide', NULL, NULL, NULL, '2026-01-01 00:00:00', NULL)",
+            ("m42393820957",),
+        )
+        conn.commit()
+        translator = mock.Mock()
+        translator.translate_title_with_fallback.side_effect = lambda title: title
+        items = scraper.fetch_items("test", conn, rate=145.0, translator=translator, session=session)
+        conn.close()
+        ids = [i["item_id"] for i in items]
+        self.assertNotIn("m42393820957", ids)
+
+    def test_fetch_items_one_off_caps_at_limit_and_does_not_persist(self):
+        html = FIXTURE_PATH.read_text(encoding="utf-8")
+        session = DummySession([
+            DummyResponse(status_code=200, url="https://buyee.jp/mercari/search?keyword=test", text=html),
+        ])
+        conn = make_test_db()
+        translator = mock.Mock()
+        translator.translate_title_with_fallback.side_effect = lambda title: title
+
+        items = scraper.fetch_items_one_off(
+            "test", rate=145.0, translator=translator, session=session, conn=conn, limit=1
+        )
+        # capped at 1
+        self.assertEqual(len(items), 1)
+        # one-off must not write to seen_items
+        seen_count = conn.execute("SELECT COUNT(*) FROM seen_items").fetchone()[0]
+        conn.close()
+        self.assertEqual(seen_count, 0)
+
+    def test_fetch_items_one_off_excludes_suppressed(self):
+        html = FIXTURE_PATH.read_text(encoding="utf-8")
+        session = DummySession([
+            DummyResponse(status_code=200, url="https://buyee.jp/mercari/search?keyword=test", text=html),
+        ])
+        conn = make_test_db()
+        conn.execute(
+            "INSERT INTO item_suppressions (item_id, reason, title, url, keyword, created_at, removed_at) "
+            "VALUES (?, 'hide', NULL, NULL, NULL, '2026-01-01 00:00:00', NULL)",
+            ("m42393820957",),
+        )
+        conn.commit()
+        translator = mock.Mock()
+        translator.translate_title_with_fallback.side_effect = lambda title: title
+        items = scraper.fetch_items_one_off(
+            "test", rate=145.0, translator=translator, session=session, conn=conn
+        )
+        conn.close()
+        ids = [i["item_id"] for i in items]
+        self.assertNotIn("m42393820957", ids)
 
 
 if __name__ == "__main__":
