@@ -5,6 +5,12 @@ venv/
 *.log
 config.ini
 seen_items.json
+seen_items.db
+seen_items.db-shm
+seen_items.db-wal
+*.db
+*.db-shm
+*.db-wal
 *.json
 mercari-bot.service
 update_bot.sh
