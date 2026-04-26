@@ -4,3 +4,5 @@ schedule
 psutil
 beautifulsoup4
 googletrans
+pytesseract
+Pillow

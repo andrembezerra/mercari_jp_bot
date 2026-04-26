@@ -105,13 +105,14 @@ def init_db(
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS notifications (
-            id       INTEGER PRIMARY KEY AUTOINCREMENT,
-            item_id  TEXT    NOT NULL,
-            keyword  TEXT    NOT NULL,
-            price    INTEGER NOT NULL,
-            title    TEXT,
-            url      TEXT,
-            sent_at  TEXT    NOT NULL
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id             TEXT    NOT NULL,
+            keyword             TEXT    NOT NULL,
+            price               INTEGER NOT NULL,
+            title               TEXT,
+            url                 TEXT,
+            sent_at             TEXT    NOT NULL,
+            telegram_message_id INTEGER
         )
         """
     )
@@ -120,6 +121,41 @@ def init_db(
         conn.execute("ALTER TABLE notifications ADD COLUMN title TEXT")
     if "url" not in existing_cols:
         conn.execute("ALTER TABLE notifications ADD COLUMN url TEXT")
+    if "telegram_message_id" not in existing_cols:
+        conn.execute("ALTER TABLE notifications ADD COLUMN telegram_message_id INTEGER")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_notifications_message_id "
+        "ON notifications(telegram_message_id)"
+    )
+    existing_kw_cols = {row[1] for row in conn.execute("PRAGMA table_info(keywords)")}
+    if "disabled_at" not in existing_kw_cols:
+        conn.execute("ALTER TABLE keywords ADD COLUMN disabled_at TEXT")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS item_suppressions (
+            item_id    TEXT PRIMARY KEY,
+            reason     TEXT NOT NULL,
+            title      TEXT,
+            url        TEXT,
+            keyword    TEXT,
+            created_at TEXT NOT NULL,
+            removed_at TEXT
+        )
+        """
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_item_suppressions_active "
+        "ON item_suppressions(removed_at)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bot_state (
+            key        TEXT PRIMARY KEY,
+            value      TEXT,
+            updated_at TEXT NOT NULL
+        )
+        """
+    )
     conn.commit()
     _migrate_json_to_db(conn, str(settings.seen_file))
     _migrate_keywords_to_db(conn, config)
@@ -159,9 +195,59 @@ def upsert_seen_item(
     conn.commit()
 
 
-def load_keywords_from_db(conn: sqlite3.Connection) -> dict[str, str]:
-    rows = conn.execute("SELECT keyword, label FROM keywords").fetchall()
+def load_keywords_from_db(
+    conn: sqlite3.Connection, include_disabled: bool = False
+) -> dict[str, str]:
+    if include_disabled:
+        rows = conn.execute("SELECT keyword, label FROM keywords").fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT keyword, label FROM keywords WHERE disabled_at IS NULL"
+        ).fetchall()
     return {kw: label for kw, label in rows}
+
+
+def load_skipped_keywords(conn: sqlite3.Connection) -> list[tuple[str, str, str]]:
+    rows = conn.execute(
+        "SELECT keyword, label, disabled_at FROM keywords "
+        "WHERE disabled_at IS NOT NULL ORDER BY disabled_at DESC"
+    ).fetchall()
+    return [(kw, label, disabled_at) for kw, label, disabled_at in rows]
+
+
+def disable_keyword(conn: sqlite3.Connection, keyword: str) -> int:
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cur = conn.execute(
+        "UPDATE keywords SET disabled_at = ? WHERE keyword = ? AND disabled_at IS NULL",
+        (now, keyword),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def enable_keyword(conn: sqlite3.Connection, keyword: str) -> int:
+    cur = conn.execute(
+        "UPDATE keywords SET disabled_at = NULL WHERE keyword = ? AND disabled_at IS NOT NULL",
+        (keyword,),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def resolve_keyword_by_label_or_keyword(
+    conn: sqlite3.Connection, value: str
+) -> tuple[str, str, str | None] | None:
+    row = conn.execute(
+        "SELECT keyword, label, disabled_at FROM keywords WHERE label = ? COLLATE NOCASE",
+        (value,),
+    ).fetchone()
+    if row:
+        return row
+    row = conn.execute(
+        "SELECT keyword, label, disabled_at FROM keywords WHERE keyword = ? COLLATE NOCASE",
+        (value,),
+    ).fetchone()
+    return row
 
 
 def add_keyword(conn: sqlite3.Connection, keyword: str, label: str) -> None:
@@ -207,8 +293,104 @@ def insert_notification(
     title: str,
     url: str,
     sent_at: str,
+    telegram_message_id: int | None = None,
 ) -> None:
     conn.execute(
-        "INSERT INTO notifications (item_id, keyword, price, title, url, sent_at) VALUES (?,?,?,?,?,?)",
-        (item_id, keyword, price, title, url, sent_at),
+        "INSERT INTO notifications "
+        "(item_id, keyword, price, title, url, sent_at, telegram_message_id) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (item_id, keyword, price, title, url, sent_at, telegram_message_id),
     )
+
+
+def find_notification_by_message_id(
+    conn: sqlite3.Connection, message_id: int
+) -> tuple[str, str, str | None, str | None] | None:
+    return conn.execute(
+        "SELECT item_id, keyword, title, url FROM notifications "
+        "WHERE telegram_message_id = ? ORDER BY id DESC LIMIT 1",
+        (message_id,),
+    ).fetchone()
+
+
+def suppress_item(
+    conn: sqlite3.Connection,
+    item_id: str,
+    reason: str,
+    title: str | None,
+    url: str | None,
+    keyword: str | None,
+) -> None:
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute(
+        """
+        INSERT INTO item_suppressions (item_id, reason, title, url, keyword, created_at, removed_at)
+        VALUES (?, ?, ?, ?, ?, ?, NULL)
+        ON CONFLICT(item_id) DO UPDATE SET
+            reason     = excluded.reason,
+            title      = excluded.title,
+            url        = excluded.url,
+            keyword    = excluded.keyword,
+            created_at = excluded.created_at,
+            removed_at = NULL
+        """,
+        (item_id, reason, title, url, keyword, now),
+    )
+    conn.commit()
+
+
+def unsuppress_item(conn: sqlite3.Connection, item_id: str) -> int:
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    cur = conn.execute(
+        "UPDATE item_suppressions SET removed_at = ? "
+        "WHERE item_id = ? AND removed_at IS NULL",
+        (now, item_id),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def is_item_suppressed(conn: sqlite3.Connection, item_id: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM item_suppressions WHERE item_id = ? AND removed_at IS NULL",
+        (item_id,),
+    ).fetchone()
+    return row is not None
+
+
+def list_active_suppressions(
+    conn: sqlite3.Connection, limit: int = 20
+) -> list[tuple[str, str, str | None, str | None, str | None, str]]:
+    rows = conn.execute(
+        "SELECT item_id, reason, title, url, keyword, created_at "
+        "FROM item_suppressions WHERE removed_at IS NULL "
+        "ORDER BY created_at DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [tuple(row) for row in rows]
+
+
+def count_active_suppressions(conn: sqlite3.Connection) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) FROM item_suppressions WHERE removed_at IS NULL"
+    ).fetchone()
+    return row[0] if row else 0
+
+
+def get_state(conn: sqlite3.Connection, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM bot_state WHERE key = ?", (key,)).fetchone()
+    return row[0] if row else None
+
+
+def set_state(conn: sqlite3.Connection, key: str, value: str) -> None:
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute(
+        "INSERT INTO bot_state (key, value, updated_at) VALUES (?, ?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        (key, value, now),
+    )
+    conn.commit()
+
+
+def is_paused(conn: sqlite3.Connection) -> bool:
+    return get_state(conn, "paused") == "1"

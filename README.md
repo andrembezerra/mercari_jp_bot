@@ -28,7 +28,7 @@ This bot monitors Mercari Japan for new listings based on your specified keyword
 ## Configuration
 
 ### `key.env`
-Create a `key.env` file with your Telegram credentials:
+Create `key.env` with your Telegram credentials:
 
 ```
 BOT_TOKEN=YOUR_BOT_TOKEN
@@ -39,7 +39,13 @@ CHAT_ID=YOUR_CHAT_ID
 - **`CHAT_ID`**: Start a chat with your bot, then visit `https://api.telegram.org/bot<YOUR_BOT_TOKEN>/getUpdates` and find the `id` field inside the `chat` object.
 
 ### `config.ini`
-Create a `config.ini` file. The `[KEYWORDS]` section is optional — keywords can be managed entirely via Telegram commands.
+Copy `config.ini.example` to `config.ini`. The `[KEYWORDS]` section is optional — keywords can be managed entirely via Telegram commands.
+
+```bash
+cp config.ini.example config.ini
+```
+
+Example `config.ini`:
 
 ```ini
 [BOT_SETTINGS]
@@ -69,13 +75,36 @@ The bot runs continuously, polling Mercari and responding to Telegram commands e
 
 ## Telegram Commands
 
+### Keywords
 | Command | Description |
 |---|---|
-| `/help` | List all available commands |
-| `/keywords` | List all active keywords |
+| `/keywords` | List all keywords (active + skipped) |
 | `/addkeyword <term> = <label>` | Add or update a keyword |
 | `/removekeyword <term>` | Remove a keyword |
-| `/summary` | Summary of all notifications in the last 24h |
+| `/skipkeyword <label or keyword>` | Temporarily disable a keyword |
+| `/enablekeyword <label or keyword>` | Re-enable a skipped keyword |
+| `/skipped` | List currently skipped keywords |
+
+### Item moderation (reply to a bot photo notification)
+| Command | Description |
+|---|---|
+| `/hide` | Permanently hide that item (reason: `hide`) |
+| `/wrong` | Permanently hide that item (reason: `wrong` — false match) |
+| `/unblock` | Remove suppression for that item |
+| `/blocked` | List currently blocked items |
+
+### Runtime control
+| Command | Description |
+|---|---|
+| `/status` | Compact bot status (paused, counts, last cycle, last error) |
+| `/pause` | Pause scraping; command polling stays active. Survives restarts. |
+| `/resume` | Resume scraping |
+| `/restart` | Restart the bot process. In Docker, `restart: unless-stopped` starts the container again automatically. |
+
+### Search
+| Command | Description |
+|---|---|
+| `/summary` | Notifications in the last 24h |
 | `/summary 3d` / `7d` / `30d` | Summary for the chosen period |
 | `/summary <label>` | Summary for a specific keyword label (last 24h) |
 | `/summary <label> 7d` | Summary for a specific keyword label and period |
@@ -87,8 +116,10 @@ Commands are only accepted from the authorised `CHAT_ID`.
 All persistent state is kept in **`seen_items.db`** (SQLite):
 
 - `seen_items` — items already notified, preventing duplicates.
-- `keywords` — active search keywords and their labels.
-- `notifications` — log of every notification sent (used by `/summary`).
+- `keywords` — search keywords and their labels (with `disabled_at` for `/skipkeyword`).
+- `notifications` — log of every notification sent (used by `/summary` and reply-based moderation).
+- `item_suppressions` — items hidden via `/hide` or `/wrong`.
+- `bot_state` — paused flag, last cycle, last error.
 
 On first boot, if a legacy `seen_items.json` file exists, it is automatically migrated to the database.
 
