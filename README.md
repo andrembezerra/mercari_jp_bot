@@ -28,13 +28,7 @@ This bot monitors Mercari Japan for new listings based on your specified keyword
 ## Configuration
 
 ### `key.env`
-Copy `key.env.example` to `key.env`, then add your Telegram credentials:
-
-```bash
-cp key.env.example key.env
-```
-
-`key.env` should contain:
+Create `key.env` with your Telegram credentials:
 
 ```
 BOT_TOKEN=YOUR_BOT_TOKEN
@@ -114,19 +108,8 @@ The bot runs continuously, polling Mercari and responding to Telegram commands e
 | `/summary 3d` / `7d` / `30d` | Summary for the chosen period |
 | `/summary <label>` | Summary for a specific keyword label (last 24h) |
 | `/summary <label> 7d` | Summary for a specific keyword label and period |
-| `/imagesearch` | Reply to a photo you sent the bot. Bot OCRs the image, runs one newest-first Mercari search, returns up to 20 items, then suggests one `/addkeyword` line. Does not auto-save. |
 
 Commands are only accepted from the authorised `CHAT_ID`.
-
-## OCR setup (for `/imagesearch`)
-
-`/imagesearch` requires Tesseract with the Japanese language pack installed locally.
-
-- **Docker:** the included `Dockerfile` already installs `tesseract-ocr` and `tesseract-ocr-jpn`.
-- **macOS:** `brew install tesseract tesseract-lang`
-- **Debian/Ubuntu:** `sudo apt-get install tesseract-ocr tesseract-ocr-jpn`
-
-The Python bindings (`pytesseract`, `Pillow`) are already in `requirements.txt`.
 
 ## Data Storage
 

@@ -9,7 +9,6 @@ from src.commands import (
     cmd_enable_keyword,
     cmd_help,
     cmd_hide,
-    cmd_image_search,
     cmd_list_keywords,
     cmd_pause,
     cmd_remove_keyword,
@@ -157,8 +156,6 @@ class TelegramClient:
             cmd_enable_keyword(conn, ctx.args, self.send_message)
         elif text == "/skipped" or text.startswith("/skipped "):
             cmd_skipped(conn, self.send_message)
-        elif text == "/imagesearch" or text.startswith("/imagesearch "):
-            cmd_image_search(conn, ctx, self)
 
     def check_commands(self, conn: sqlite3.Connection, offset: int) -> int:
         try:

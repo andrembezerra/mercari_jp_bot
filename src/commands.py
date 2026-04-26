@@ -284,13 +284,6 @@ def cmd_skipped(conn: sqlite3.Connection, send_message) -> None:
         )
     send_message("\n".join(lines))
 
-
-def cmd_image_search(conn: sqlite3.Connection, ctx: CommandContext, client) -> None:
-    from src.image_search import run_image_search
-
-    run_image_search(conn, ctx, client)
-
-
 def cmd_help(send_message) -> None:
     send_message(
         "🤖 <b>Comandos disponíveis</b>\n"
@@ -317,7 +310,6 @@ def cmd_help(send_message) -> None:
         "\n"
         "<b>Busca</b>\n"
         "/summary — resumo de notificações\n"
-        "/imagesearch — responda a uma foto para buscar via OCR\n"
         "\n"
         "Períodos do summary: <code>24h</code> · <code>3d</code> · <code>7d</code> · <code>30d</code>"
     )
